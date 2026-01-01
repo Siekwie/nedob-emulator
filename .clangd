@@ -1,0 +1,14 @@
+CompileFlags:
+  Add:
+    - -IC:/Users/bruce/Documents/DEV/AA_CPP/SDL/2048/vendored/include
+    - -std=c++23
+    - -Wno-unused-parameter
+    - -Wno-missing-declarations
+
+Diagnostics:
+  UnusedIncludes: None
+  MissingIncludes: None
+  ClangTidy:
+    Remove:
+      - modernize-*
+      - readability-*
