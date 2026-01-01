@@ -1,7 +1,10 @@
 CompileFlags:
   Add:
-    - -IC:/Users/bruce/Documents/DEV/AA_CPP/SDL/2048/vendored/include
+    - -IC:/Users/bruce/Documents/DEV/AA_CPP/SDL/nedob_emulator/vendored/include
     - -std=c++23
+    - -Wall
+    - -Wextra
+    - -Werror
     - -Wno-unused-parameter
     - -Wno-missing-declarations
 

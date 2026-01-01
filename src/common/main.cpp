@@ -1,53 +1,112 @@
+#define SDL_MAIN_HANDLED
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
 #include <SDL3/SDL_video.h>
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_init.h>
+#include "../file_selector/file_selector.hpp"
+#include "../file_selector/rom_type.hpp"
 #include <cstdio>
+#include <string>
 
 int main(int argc, char* argv[])
 {
+    // Tell SDL we're handling the main function ourselves
+    SDL_SetMainReady();
+    
     // Initialize SDL with video subsystem
     if (!SDL_Init(SDL_INIT_VIDEO)) {
-        std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        const char* error = SDL_GetError();
+        if (error && error[0] != '\0') {
+            std::fprintf(stderr, "SDL_Init failed: %s\n", error);
+        } else {
+            std::fprintf(stderr, "SDL_Init failed: Unknown error (error string was empty)\n");
+        }
         return 1;
     }
 
-    // Create a window
+    // Create a minimal window for the file selector dialog
+    // The window can be hidden or minimized, but SDL dialogs may need it
     SDL_Window* window = SDL_CreateWindow(
-        "Nedob Emulator",
-        800,  // width
-        600,  // height
-        0     // flags (0 = default)
+        "Nedob Emulator - ROM Selector",
+        800, 600,
+        SDL_WINDOW_HIDDEN  // Start hidden, we only need it for the dialog
     );
-
+    
     if (!window) {
-        std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+        std::fprintf(stderr, "Failed to create window: %s\n", SDL_GetError());
         SDL_Quit();
         return 1;
     }
 
-    std::printf("Window created successfully!\n");
-    std::printf("Press ESC or close the window to exit.\n");
+    std::printf("Nedob Emulator - ROM Selector\n");
+    std::printf("Select a ROM file to load...\n");
 
-    // Main event loop
+    // Create file selector
+    // file selector will load rom into emulator
+    // upon loading rom, selector closes
+    // emulator will load rom with correct core
+    FileSelector selector(window);
+    
+    RomSelectionResult result;
+    bool rom_selected = false;
+    
+    // Show the file dialog
+    selector.showDialog([&result, &rom_selected](const RomSelectionResult& res) {
+        result = res;
+        rom_selected = true;
+    });
+
+    // Main event loop - wait for file selection or quit
     bool running = true;
     SDL_Event event;
 
-    while (running) {
+    while (running && !rom_selected) {
         // Poll for events
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT) {
                 running = false;
-            } else if (event.type == SDL_EVENT_KEY_DOWN) {
-                // Exit on ESC key
-                if (event.key.key == SDLK_ESCAPE) {
-                    running = false;
-                }
+                result.cancelled = true;
+                rom_selected = true;
             }
         }
 
         // Small delay to prevent 100% CPU usage
         SDL_Delay(16); // ~60 FPS
+    }
+
+    // Process the ROM selection result
+    if (result.error) {
+        std::fprintf(stderr, "Error selecting ROM file: %s\n", SDL_GetError());
+    } else if (result.cancelled) {
+        std::printf("ROM selection cancelled.\n");
+    } else if (!result.filepath.empty()) {
+        std::printf("Selected ROM: %s\n", result.filepath.c_str());
+        std::printf("ROM Type: %s\n", romTypeToString(result.rom_type));
+        
+        // TODO: Load ROM into appropriate emulator core based on result.rom_type
+        // - If result.rom_type == RomType::NDS or RomType::NDSi -> load NDS core
+        // - If result.rom_type == RomType::ThreeDS -> load 3DS core
+        // - Close the selector window
+        // - Initialize and run the emulator with the selected ROM
+        
+        switch (result.rom_type) {
+            case RomType::NDS:
+            case RomType::NDSi:
+                std::printf("Would load NDS core with ROM: %s\n", result.filepath.c_str());
+                // TODO: Initialize NDS core and load ROM
+                break;
+            case RomType::ThreeDS:
+                std::printf("Would load 3DS core with ROM: %s\n", result.filepath.c_str());
+                // TODO: Initialize 3DS core and load ROM
+                break;
+            case RomType::Unknown:
+                std::fprintf(stderr, "Warning: Unknown ROM type for file: %s\n", result.filepath.c_str());
+                break;
+            default:
+                std::fprintf(stderr, "Invalid ROM type detected.\n");
+                break;
+        }
     }
 
     // Cleanup

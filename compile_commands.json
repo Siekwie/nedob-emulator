@@ -1,6 +1,6 @@
 [
   {
-    "directory": "C:/Users/bruce/Documents/DEV/AA_CPP/SDL/2048",
+    "directory": "C:/Users/bruce/Documents/DEV/AA_CPP/SDL/nedob_emulator",
     "arguments": [
       "clang++",
       "--target=x86_64-pc-windows-msvc",
@@ -8,7 +8,7 @@
       "-DWIN32",
       "-D_WINDOWS",
       "-D_CRT_SECURE_NO_WARNINGS",
-      "-IC:/Users/bruce/Documents/DEV/AA_CPP/SDL/2048/vendored/include",
+      "-IC:/Users/bruce/Documents/DEV/AA_CPP/SDL/nedob_emulator/vendored/include",
       "-isystem",
       "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/include",
       "-isystem",

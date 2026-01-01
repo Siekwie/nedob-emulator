@@ -10,7 +10,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIGURATION>")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIGURATION>")
 
 # SDL3 include directory
-set(SDL3_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/vendored/SDL3/include")
+set(SDL3_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/vendored/include")
 
 # SDL3 library directory (pre-built libraries)
 set(SDL3_LIB_DIR "${CMAKE_SOURCE_DIR}/vendored/SDL3")
