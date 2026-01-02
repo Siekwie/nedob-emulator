@@ -6,6 +6,7 @@
 #include <SDL3/SDL_init.h>
 #include "../file_selector/file_selector.hpp"
 #include "../file_selector/rom_type.hpp"
+#include "application.hpp"
 #include <cstdio>
 #include <string>
 
@@ -78,39 +79,66 @@ int main(int argc, char* argv[])
     // Process the ROM selection result
     if (result.error) {
         std::fprintf(stderr, "Error selecting ROM file: %s\n", SDL_GetError());
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
     } else if (result.cancelled) {
         std::printf("ROM selection cancelled.\n");
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 0;
     } else if (!result.filepath.empty()) {
         std::printf("Selected ROM: %s\n", result.filepath.c_str());
         std::printf("ROM Type: %s\n", romTypeToString(result.rom_type));
         
-        // TODO: Load ROM into appropriate emulator core based on result.rom_type
-        // - If result.rom_type == RomType::NDS or RomType::NDSi -> load NDS core
-        // - If result.rom_type == RomType::ThreeDS -> load 3DS core
-        // - Close the selector window
-        // - Initialize and run the emulator with the selected ROM
+        // Close the selector window - we'll create a new one in the application
+        SDL_DestroyWindow(window);
         
+        // Determine core type based on ROM type
+        std::string core_type;
         switch (result.rom_type) {
             case RomType::NDS:
             case RomType::NDSi:
-                std::printf("Would load NDS core with ROM: %s\n", result.filepath.c_str());
-                // TODO: Initialize NDS core and load ROM
+                core_type = "nds";
                 break;
             case RomType::ThreeDS:
-                std::printf("Would load 3DS core with ROM: %s\n", result.filepath.c_str());
-                // TODO: Initialize 3DS core and load ROM
-                break;
-            case RomType::Unknown:
-                std::fprintf(stderr, "Warning: Unknown ROM type for file: %s\n", result.filepath.c_str());
+                core_type = "3ds";
                 break;
             default:
-                std::fprintf(stderr, "Invalid ROM type detected.\n");
+                std::fprintf(stderr, "Warning: Unknown ROM type, attempting NDS core\n");
+                core_type = "nds";
                 break;
         }
+        
+        // Create and initialize the application
+        Application app;
+        if (!app.initialize()) {
+            std::fprintf(stderr, "Failed to initialize application\n");
+            SDL_Quit();
+            return 1;
+        }
+        
+        // Load the ROM
+        if (!app.loadROM(result.filepath, core_type)) {
+            std::fprintf(stderr, "Failed to load ROM\n");
+            SDL_Quit();
+            return 1;
+        }
+        
+        // Run the emulator
+        std::printf("Starting emulation...\n");
+        std::printf("Controls:\n");
+        std::printf("  ESC - Exit\n");
+        std::printf("  P - Pause/Resume\n");
+        std::printf("  Ctrl+R - Reset\n");
+        std::printf("\n");
+        
+        app.run();
+        
+        std::printf("Emulation ended.\n");
     }
 
     // Cleanup
-    SDL_DestroyWindow(window);
     SDL_Quit();
 
     return 0;
