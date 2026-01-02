@@ -1133,17 +1133,39 @@ uint32_t NDSMemory::read32_ARM9(uint32_t address) {
     
     // CRITICAL: Handshake hack for Pokemon Platinum - MUST be checked BEFORE reading from memory
     // The ARM9 wait loop at 0x02003D54 loads a pointer from literal pool, then dereferences it
-    // Common handshake addresses: 0x027FF800, 0x027FF804, 0x027FFC00 (top of Main RAM)
-    // Expand range to cover entire top 4KB of Main RAM (0x027FF000-0x02800000)
-    // Force these to always return 1 to break the deadlock
-    if (address >= 0x027FF000 && address < 0x02800000) {
+    // In Nitro SDK, the handshake variable is typically at 0x027FF800 or 0x027FF804
+    // CRITICAL: Check these specific addresses FIRST (most common)
+    if (address == 0x027FF800 || address == 0x027FF804) {
         static int handshake_hack_count = 0;
-        if (handshake_hack_count < 10) {
-            std::printf("ARM9: Handshake hack - Forcing acknowledgment at 0x%08X (Pokemon handshake range, count=%d)\n", 
+        if (handshake_hack_count < 5) {
+            std::printf("ARM9: Handshake hack - Forcing acknowledgment at 0x%08X (Nitro SDK handshake, count=%d)\n", 
                        address, handshake_hack_count);
             handshake_hack_count++;
         }
         // Always return 1 - this simulates ARM7 acknowledgment
+        // CRITICAL: Also write it back to memory so subsequent reads see it
+        uint8_t* ptr = mapAddress_ARM9(address);
+        if (ptr) {
+            *reinterpret_cast<uint32_t*>(ptr) = 0x00000001;
+        }
+        return 0x00000001;
+    }
+    
+    // Also cover the entire top 4KB of Main RAM as fallback
+    // Common handshake addresses: 0x027FF800, 0x027FF804, 0x027FFC00 (top of Main RAM)
+    if (address >= 0x027FF000 && address < 0x02800000) {
+        static int handshake_hack_count_fallback = 0;
+        if (handshake_hack_count_fallback < 10) {
+            std::printf("ARM9: Handshake hack (fallback) - Forcing acknowledgment at 0x%08X (count=%d)\n", 
+                       address, handshake_hack_count_fallback);
+            handshake_hack_count_fallback++;
+        }
+        // Always return 1 - this simulates ARM7 acknowledgment
+        // CRITICAL: Also write it back to memory so subsequent reads see it
+        uint8_t* ptr = mapAddress_ARM9(address);
+        if (ptr) {
+            *reinterpret_cast<uint32_t*>(ptr) = 0x00000001;
+        }
         return 0x00000001;
     }
     

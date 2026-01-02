@@ -199,14 +199,28 @@ bool NDSCore::parseROMHeader() {
     // The Secure Area (0x02000800-0x02004000) contains loader code and ASCII strings
     // that can be executed as invalid instructions (e.g., 0x2106C0DE = "CODE", 0x4B44535B = "SDK[")
     // By jumping directly to 0x02004000, we skip this area and start at the actual game code
+    bool forced_to_0x02004000 = false;
     if (arm9_entry >= 0x02000800 && arm9_entry < 0x02004000) {
         std::printf("ARM9 entry point 0x%08X is in Secure Area - forcing to 0x02004000 to skip loader\n", arm9_entry);
         arm9_entry = 0x02004000;
+        forced_to_0x02004000 = true;
     } else {
         std::printf("ARM9 entry point 0x%08X is outside Secure Area - using as-is\n", arm9_entry);
     }
     
     arm9_->setEntryPoint(arm9_entry);
+    
+    // CRITICAL: At 0x02004000, the game code is ALWAYS in Thumb mode
+    // The actual game engine (Nitro SDK) starts in Thumb mode, not ARM mode
+    // Force Thumb mode (bit 5 of CPSR = 1) when entry point is 0x02004000
+    if (forced_to_0x02004000 || arm9_entry == 0x02004000) {
+        uint32_t arm9_cpsr = arm9_->getCPSR();
+        arm9_cpsr |= (1 << 5);  // Set Thumb bit (bit 5)
+        arm9_cpsr = (arm9_cpsr & ~0x1F) | 0x13;  // Supervisor mode
+        arm9_cpsr &= ~(1 << 7);  // Enable interrupts (clear I bit)
+        arm9_->setCPSR(arm9_cpsr);
+        std::printf("ARM9 forced to Thumb mode at entry point 0x02004000 (CPSR=0x%08X)\n", arm9_cpsr);
+    }
     arm7_->setEntryPoint(header->arm7_entry_address);
     
     // Initialize stack pointers (R13) - CRITICAL: Must be set BEFORE execution
@@ -225,14 +239,14 @@ bool NDSCore::parseROMHeader() {
     arm7_->setRegister(1, 0x0000000F);  // R1 = 0x0F (Component ID)
     std::printf("ARM7 boot state HLE: R0=0x%08X, R1=0x%08X\n", 0x00000001, 0x0000000F);
     
-    // CRITICAL: Set CPU mode based on entry point bit 0
-    // setEntryPoint() already handles the Thumb bit correctly
-    // Just ensure interrupts are enabled and we're in Supervisor mode
-    // Don't override the mode set by setEntryPoint() - it checks bit 0 correctly
-    uint32_t arm9_cpsr = arm9_->getCPSR();
-    arm9_cpsr = (arm9_cpsr & ~0x1F) | 0x13;  // Supervisor mode, preserve Thumb bit
-    arm9_cpsr &= ~(1 << 7);  // Enable interrupts (clear I bit)
-    arm9_->setCPSR(arm9_cpsr);
+    // CRITICAL: If we didn't force Thumb mode above, set CPU mode based on entry point bit 0
+    // Don't override the mode if we already forced Thumb mode above
+    if (!forced_to_0x02004000 && arm9_entry != 0x02004000) {
+        uint32_t arm9_cpsr = arm9_->getCPSR();
+        arm9_cpsr = (arm9_cpsr & ~0x1F) | 0x13;  // Supervisor mode, preserve Thumb bit
+        arm9_cpsr &= ~(1 << 7);  // Enable interrupts (clear I bit)
+        arm9_->setCPSR(arm9_cpsr);
+    }
     
     arm7_->setCPSR(0x13);  // Supervisor mode, ARM state, interrupts enabled
     
@@ -267,10 +281,23 @@ void NDSCore::reset() {
     // The Secure Area (0x02000800-0x02004000) contains loader code and ASCII strings
     // that can be executed as invalid instructions
     uint32_t arm9_entry = header->arm9_entry_address;
+    bool forced_to_0x02004000 = false;
     if (arm9_entry >= 0x02000800 && arm9_entry < 0x02004000) {
         arm9_entry = 0x02004000;  // Skip Secure Area
+        forced_to_0x02004000 = true;
     }
     arm9_->setEntryPoint(arm9_entry);
+    
+    // CRITICAL: At 0x02004000, the game code is ALWAYS in Thumb mode
+    // Force Thumb mode (bit 5 of CPSR = 1) when entry point is 0x02004000
+    if (forced_to_0x02004000 || arm9_entry == 0x02004000) {
+        uint32_t arm9_cpsr = arm9_->getCPSR();
+        arm9_cpsr |= (1 << 5);  // Set Thumb bit (bit 5)
+        arm9_cpsr = (arm9_cpsr & ~0x1F) | 0x13;  // Supervisor mode
+        arm9_cpsr &= ~(1 << 7);  // Enable interrupts (clear I bit)
+        arm9_->setCPSR(arm9_cpsr);
+        std::printf("ARM9 forced to Thumb mode at entry point 0x02004000 (CPSR=0x%08X)\n", arm9_cpsr);
+    }
     arm7_->setEntryPoint(header->arm7_entry_address);
     
     // Initialize stack pointers (R13) - critical for function calls
@@ -284,14 +311,14 @@ void NDSCore::reset() {
     arm7_->setRegister(0, 0x00000001);  // R0 = 1 (BIOS boot successful)
     arm7_->setRegister(1, 0x0000000F);  // R1 = 0x0F (Component ID)
     
-    // CRITICAL: Set CPU mode based on entry point bit 0
-    // setEntryPoint() already handles the Thumb bit correctly
-    // Just ensure interrupts are enabled and we're in Supervisor mode
-    // Don't override the mode set by setEntryPoint() - it checks bit 0 correctly
-    uint32_t arm9_cpsr = arm9_->getCPSR();
-    arm9_cpsr = (arm9_cpsr & ~0x1F) | 0x13;  // Supervisor mode, preserve Thumb bit
-    arm9_cpsr &= ~(1 << 7);  // Enable interrupts (clear I bit)
-    arm9_->setCPSR(arm9_cpsr);
+    // CRITICAL: If we didn't force Thumb mode above, set CPU mode based on entry point bit 0
+    // Don't override the mode if we already forced Thumb mode above
+    if (!forced_to_0x02004000 && arm9_entry != 0x02004000) {
+        uint32_t arm9_cpsr = arm9_->getCPSR();
+        arm9_cpsr = (arm9_cpsr & ~0x1F) | 0x13;  // Supervisor mode, preserve Thumb bit
+        arm9_cpsr &= ~(1 << 7);  // Enable interrupts (clear I bit)
+        arm9_->setCPSR(arm9_cpsr);
+    }
     
     arm7_->setCPSR(0x13);  // Supervisor mode, ARM state, interrupts enabled
     
