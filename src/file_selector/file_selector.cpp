@@ -27,11 +27,11 @@ std::vector<SDL_DialogFileFilter> FileSelector::getRomFilters() {
     std::vector<SDL_DialogFileFilter> filters;
     
     // All supported ROM files
-    filters.push_back({ "All Supported ROMs", "nds;3ds;cia" });
+    filters.push_back({ "All Supported ROMs", "nds;3ds;cci;cia;cxi;app;3dsx" });
     
     // Individual filters
     filters.push_back({ "Nintendo DS ROMs", "nds" });
-    filters.push_back({ "Nintendo 3DS ROMs", "3ds;cia" });
+    filters.push_back({ "Nintendo 3DS ROMs", "3ds;cci;cia;cxi;app;3dsx" });
     
     // All files (for advanced users)
     filters.push_back({ "All Files", "*" });

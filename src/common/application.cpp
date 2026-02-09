@@ -1,196 +1,129 @@
 #include "application.hpp"
-#include "../frontend/frontend.hpp"
-#include "../cores/nds/nds_core.hpp"
-#include "../cores/nds/ppu.hpp"
-#include "emulator_core.hpp"
-#include <SDL3/SDL.h>
+#include "../cores/3ds/ThreeDsCore.hpp"
 #include <SDL3/SDL_events.h>
+#include <SDL3/SDL_render.h>
+#include <SDL3/SDL_video.h>
 #include <cstdio>
-#include <algorithm>
 
-Application::Application()
-    : running_(false)
-    , paused_(false)
-    , target_frame_rate_(60.0)  // NDS runs at ~60 FPS
-    , frame_rate_(0.0)
-    , frame_time_accumulator_(0.0)
-{
-}
+Application::Application() = default;
 
 Application::~Application() {
-    // Cleanup is handled by unique_ptr destructors
+    if (renderer_) {
+        SDL_DestroyRenderer(renderer_);
+        renderer_ = nullptr;
+    }
+    if (window_) {
+        SDL_DestroyWindow(window_);
+        window_ = nullptr;
+    }
 }
 
 bool Application::initialize() {
-    // Frontend will be initialized when we load a ROM
-    // For now, just mark as ready
-    running_ = true;
-    last_frame_time_ = std::chrono::high_resolution_clock::now();
+    window_ = SDL_CreateWindow("Nedob Emulator", 512, 384, 0);
+    if (!window_) {
+        std::fprintf(stderr, "Failed to create emulator window: %s\n", SDL_GetError());
+        return false;
+    }
+
+    renderer_ = SDL_CreateRenderer(window_, nullptr);
+    if (!renderer_) {
+        std::fprintf(stderr, "Failed to create renderer: %s\n", SDL_GetError());
+        return false;
+    }
+
     return true;
 }
 
-bool Application::loadROM(const std::string& rom_path, const std::string& core_type) {
-    // Create frontend first (needed for core initialization)
-    frontend_ = std::make_unique<Frontend>();
-    if (!frontend_->initialize()) {
-        std::fprintf(stderr, "Failed to initialize frontend\n");
+bool Application::loadROM(const std::string& path, const std::string& core_type) {
+    if (core_type != "3ds") {
+        std::fprintf(stderr, "Only 3DS core is supported right now.\n");
         return false;
     }
-    
-    // Create appropriate core based on type
-    if (core_type == "nds") {
-        core_ = std::make_unique<NDSCore>();
-    } else if (core_type == "3ds") {
-        // TODO: Implement 3DS core
-        std::fprintf(stderr, "3DS core not yet implemented\n");
-        return false;
-    } else {
-        std::fprintf(stderr, "Unknown core type: %s\n", core_type.c_str());
-        return false;
-    }
-    
-    // Load ROM into core
-    if (!core_->loadROM(rom_path)) {
-        std::fprintf(stderr, "Failed to load ROM: %s\n", rom_path.c_str());
-        return false;
-    }
-    
-    // Connect core to frontend
-    core_->setFrontend(frontend_.get());
-    
-    std::printf("ROM loaded successfully: %s\n", rom_path.c_str());
-    std::printf("Core type: %s\n", core_type.c_str());
-    
-    return true;
+
+    loaded_core_ = std::make_unique<ThreeDS>();
+    return loaded_core_->loadROM(path);
 }
 
 void Application::run() {
-    if (!running_ || !core_ || !frontend_) {
-        std::fprintf(stderr, "Application not properly initialized\n");
+    if (!loaded_core_) {
+        std::fprintf(stderr, "No core loaded.\n");
         return;
     }
-    
-    const double target_frame_time = 1.0 / target_frame_rate_;
-    
-    while (running_) {
-        frame_start_time_ = std::chrono::high_resolution_clock::now();
-        
-        // Handle events (input, window close, etc.)
-        handleEvents();
-        
+
+    bool running = true;
+    while (running) {
+        processEvents(running);
+
         if (!paused_) {
-            // Run emulation for one frame
-            processFrame();
+            loaded_core_->runFrame();
         }
-        
-        // Get frame from core and present to frontend
-        if (core_ && frontend_) {
-            // Get PPU frame buffers and render them
-            NDSCore* nds_core = dynamic_cast<NDSCore*>(core_.get());
-            if (nds_core && nds_core->getPPU()) {
-                PPU* ppu = nds_core->getPPU();
-                frontend_->renderNDSScreens(ppu->getMainScreenBuffer(), ppu->getSubScreenBuffer());
-            }
-        }
-        
-        // Present frame to frontend
-        frontend_->present();
-        
-        // Frame rate limiting
-        auto frame_end_time = std::chrono::high_resolution_clock::now();
-        auto frame_duration = std::chrono::duration<double>(frame_end_time - frame_start_time_).count();
-        
-        if (frame_duration < target_frame_time) {
-            // Sleep to maintain target frame rate
-            auto sleep_time = target_frame_time - frame_duration;
-            SDL_Delay(static_cast<Uint32>(sleep_time * 1000.0));
-        }
-        
-        // Update frame rate statistics
-        updateFrameRate();
-        last_frame_time_ = frame_start_time_;
+
+        renderFrame();
+        SDL_Delay(16);
     }
 }
 
-void Application::requestExit() {
-    running_ = false;
-}
-
-void Application::reset() {
-    if (core_) {
-        core_->reset();
-    }
-}
-
-bool Application::saveState(const std::string& filepath) {
-    if (core_) {
-        return core_->saveState(filepath);
-    }
-    return false;
-}
-
-bool Application::loadState(const std::string& filepath) {
-    if (core_) {
-        return core_->loadState(filepath);
-    }
-    return false;
-}
-
-void Application::processFrame() {
-    if (core_) {
-        // Run core for one frame
-        // The core will handle its own timing internally
-        core_->runFrame();
-    }
-}
-
-void Application::updateFrameRate() {
-    auto current_time = std::chrono::high_resolution_clock::now();
-    auto delta_time = std::chrono::duration<double>(current_time - last_frame_time_).count();
-    
-    if (delta_time > 0.0) {
-        // Exponential moving average for smooth frame rate display
-        double instant_fps = 1.0 / delta_time;
-        frame_rate_ = frame_rate_ * 0.9 + instant_fps * 0.1;
-    }
-}
-
-void Application::handleEvents() {
+void Application::processEvents(bool& running) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
-        // Let frontend handle events first (input, window management)
-        if (frontend_) {
-            if (frontend_->handleEvent(event)) {
-                continue;  // Event was handled by frontend
+        if (event.type == SDL_EVENT_QUIT) {
+            running = false;
+        } else if (event.type == SDL_EVENT_KEY_DOWN) {
+            const SDL_Keycode key = event.key.key;
+            if (key == SDLK_ESCAPE) {
+                running = false;
+            } else if (key == SDLK_P) {
+                paused_ = !paused_;
+                if (loaded_core_) {
+                    loaded_core_->setPaused(paused_);
+                }
+            } else if (key == SDLK_R &&
+                       (event.key.mod & SDL_KMOD_CTRL)) {
+                if (loaded_core_) {
+                    loaded_core_->reset();
+                }
             }
         }
-        
-        // Handle application-level events
-        switch (event.type) {
-            case SDL_EVENT_QUIT:
-                requestExit();
-                break;
-                
-            case SDL_EVENT_KEY_DOWN:
-                // Handle global hotkeys
-                if (event.key.key == SDLK_ESCAPE) {
-                    requestExit();
-                } else if (event.key.key == SDLK_P) {
-                    setPaused(!paused_);
-                    std::printf("Emulation %s\n", paused_ ? "paused" : "resumed");
-                } else if (event.key.key == SDLK_R && (event.key.mod & SDL_KMOD_CTRL)) {
-                    reset();
-                    std::printf("Core reset\n");
-                }
-                break;
-                
-            default:
-                break;
-        }
-        
-        // Pass events to core for input handling
-        if (core_ && !paused_) {
-            core_->handleEvent(event);
-        }
     }
+}
+
+void Application::renderFrame() {
+    if (!renderer_) {
+        return;
+    }
+
+    int width = 0;
+    int height = 0;
+    SDL_GetWindowSize(window_, &width, &height);
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    const bool blink = (frame_count_ / 30) % 2 == 0;
+    const uint8_t top_blue = blink ? 160 : 80;
+    const uint8_t bottom_green = blink ? 160 : 80;
+
+    SDL_SetRenderDrawColor(renderer_, 10, 10, 30, 255);
+    SDL_RenderClear(renderer_);
+
+    SDL_FRect top_rect{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height / 2)};
+    SDL_FRect bottom_rect{0.0f, static_cast<float>(height / 2), static_cast<float>(width),
+                          static_cast<float>(height - (height / 2))};
+
+    SDL_SetRenderDrawColor(renderer_, 30, 90, top_blue, 255);
+    SDL_RenderFillRect(renderer_, &top_rect);
+
+    SDL_SetRenderDrawColor(renderer_, 90, bottom_green, 30, 255);
+    SDL_RenderFillRect(renderer_, &bottom_rect);
+
+    SDL_RenderPresent(renderer_);
+
+    if (frame_count_ % 60 == 0) {
+        char title[64];
+        std::snprintf(title, sizeof(title), "Nedob Emulator - Frame %llu",
+                      static_cast<unsigned long long>(frame_count_));
+        SDL_SetWindowTitle(window_, title);
+    }
+
+    ++frame_count_;
 }

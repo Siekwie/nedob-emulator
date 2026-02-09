@@ -15,8 +15,8 @@ int main(int argc, char* argv[])
     // Tell SDL we're handling the main function ourselves
     SDL_SetMainReady();
     
-    // Initialize SDL with video subsystem
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
+    // Initialize SDL with video and audio subsystems
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
         const char* error = SDL_GetError();
         if (error && error[0] != '\0') {
             std::fprintf(stderr, "SDL_Init failed: %s\n", error);
@@ -97,16 +97,12 @@ int main(int argc, char* argv[])
         // Determine core type based on ROM type
         std::string core_type;
         switch (result.rom_type) {
-            case RomType::NDS:
-            case RomType::NDSi:
-                core_type = "nds";
-                break;
             case RomType::ThreeDS:
                 core_type = "3ds";
                 break;
             default:
-                std::fprintf(stderr, "Warning: Unknown ROM type, attempting NDS core\n");
-                core_type = "nds";
+                std::fprintf(stderr, "Warning: Unknown ROM type, attempting 3DS core\n");
+                core_type = "3ds";
                 break;
         }
         
@@ -127,11 +123,6 @@ int main(int argc, char* argv[])
         
         // Run the emulator
         std::printf("Starting emulation...\n");
-        std::printf("Controls:\n");
-        std::printf("  ESC - Exit\n");
-        std::printf("  P - Pause/Resume\n");
-        std::printf("  Ctrl+R - Reset\n");
-        std::printf("\n");
         
         app.run();
         

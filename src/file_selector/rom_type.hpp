@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cctype>
 #include <string>
 #include <string_view>
 
@@ -17,7 +18,6 @@ enum class RomType {
 
 /**
  * Detects the ROM type based on file extension.
- * 
  * @param filepath The path to the ROM file
  * @return The detected RomType
  */
@@ -34,21 +34,25 @@ inline RomType detectRomType(std::string_view filepath) {
     for (size_t i = dot_pos + 1; i < filepath.length(); ++i) {
         char c = filepath[i];
         if (c >= 'A' && c <= 'Z') {
-            ext += static_cast<char>(c + 32); // Convert to lowercase
+            // 0x20 is the hex value for 32, the sixth bit in ASCII is the case bit
+            // using bitwise OR forces sixth bit to 1, making the character lowercase
+            ext += static_cast<char>(c | 0x20); // Convert to lowercase
         } else {
-            ext += c;
+            ext += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
     }
-    
     // Match extension to ROM type
     if (ext == "nds") {
         return RomType::NDS;
-    } else if (ext == "3ds") {
+    } else if (ext == "3ds" || ext == "cci") {
         return RomType::ThreeDS;
     } else if (ext == "cia") {
         return RomType::ThreeDS;
+    } else if (ext == "cxi" || ext == "app") {
+        return RomType::ThreeDS;
+    } else if (ext == "3dsx") {
+        return RomType::ThreeDS;
     }
-    
     return RomType::Unknown;
 }
 
