@@ -1,0 +1,46 @@
+Nedob Emulator - ROM Selector
+Select a ROM file to load...
+Selected ROM: C:\Users\bruce\Documents\C_RGames\ROMS\3ds\Pokemon Sun (Europe) (EnJaFrDeEsItZhKo)\Pokemon Sun (Europe) (En,Ja,Fr,De,Es,It,Zh,Ko).3ds
+ROM Type: Nintendo 3DS
+Loader: code source = raw (no crypto). First 16 bytes: 07 00 00 EB 6A 11 00 EB 4B 1A 00 EB 85 11 00 EB 
+Loader: WARNING: first word is not typical ARM B; may be encrypted or wrong offset.
+ThreeDS: ROM loaded: C:\Users\bruce\Documents\C_RGames\ROMS\3ds\Pokemon Sun (Europe) (EnJaFrDeEsItZhKo)\Pokemon Sun (Europe) (En,Ja,Fr,De,Es,It,Zh,Ko).3ds (entry=0x00100000, code=5713920 bytes)
+Starting emulation...
+BX LR: LR=0x00100004 -> PC
+Stack write addr=0x0FAFFFF8 value=0x00000000 SP(R13)=0x0FB00000 PC=0x001045BC
+Stack write addr=0x0FAFFFFC value=0x00100008 SP(R13)=0x0FB00000 PC=0x001045BC
+BX LR: LR=0x001045D4 -> PC
+Stack write addr=0x0FAFFFF0 value=0x006A2240 SP(R13)=0x0FAFFFF8 PC=0x00104A50
+Stack write addr=0x0FAFFFF4 value=0x001045E4 SP(R13)=0x0FAFFFF8 PC=0x00104A50
+LDM POP PC: loading value 0x001045E4 from addr 0x0FAFFFF4 into PC
+Stack write addr=0x0FAFFFF0 value=0x006A2240 SP(R13)=0x0FAFFFF8 PC=0x00104A98
+Stack write addr=0x0FAFFFF4 value=0x001045F8 SP(R13)=0x0FAFFFF8 PC=0x00104A98
+LDM POP PC: loading value 0x001045F8 from addr 0x0FAFFFF4 into PC
+LDM POP PC: loading value 0x00100008 from addr 0x0FAFFFFC into PC
+Stack write addr=0x0FAFFFE8 value=0x00000000 SP(R13)=0x0FB00000 PC=0x00104628
+Stack write addr=0x0FAFFFEC value=0x00000000 SP(R13)=0x0FB00000 PC=0x00104628
+Stack write addr=0x0FAFFFF0 value=0x00000000 SP(R13)=0x0FB00000 PC=0x00104628
+Stack write addr=0x0FAFFFF4 value=0x00000000 SP(R13)=0x0FB00000 PC=0x00104628
+Stack write addr=0x0FAFFFF8 value=0x00000000 SP(R13)=0x0FB00000 PC=0x00104628
+Stack write addr=0x0FAFFFFC value=0x00100010 SP(R13)=0x0FB00000 PC=0x00104628
+Stack write addr=0x0FAFFFD0 value=0x00000000 SP(R13)=0x0FAFFFE8 PC=0x0010482C
+Stack write addr=0x0FAFFFD4 value=0x00000000 SP(R13)=0x0FAFFFE8 PC=0x0010482C
+Stack write addr=0x0FAFFFD8 value=0x00000000 SP(R13)=0x0FAFFFE8 PC=0x0010482C
+Stack write addr=0x0FAFFFDC value=0x00000000 SP(R13)=0x0FAFFFE8 PC=0x0010482C
+Stack write addr=0x0FAFFFE0 value=0x00000000 SP(R13)=0x0FAFFFE8 PC=0x0010482C
+Stack write addr=0x0FAFFFE4 value=0x00104630 SP(R13)=0x0FAFFFE8 PC=0x0010482C
+BX LR: LR=0x0010483C -> PC
+Stack write addr=0x0FAFFFCC value=0x00104844 SP(R13)=0x0FAFFFD0 PC=0x00104BD0
+Stack write addr=0x0FAFFFE8 value=0x00000000 SP(R13)=0x0FAFFFE0 PC=0x00104BDC
+Stack write addr=0x0FAFFFEC value=0xBCC7D4F3 SP(R13)=0x0FAFFFE0 PC=0x00104BE8
+Stack write addr=0x0FAFFFDC value=0x0FAFFFE8 SP(R13)=0x0FAFFFE0 PC=0x00105570
+SVC 0x38 GetResourceLimit  R0=0x0FAFFFE8 R1=0x3DFAB273 R2=0x00000000 R3=0x00000000  PC=0x00105578
+Stack write addr=0x0FAFFFE8 value=0xFFFF8001 SP(R13)=0x0FAFFFDC PC=0x0010557C
+BX LR: LR=0x00104BF8 -> PC
+SVC 0x3A GetResourceLimitCurrentValues  R0=0x00000000 R1=0xFFFF8001 R2=0x0FAFFFEC R3=0x00000001  PC=0x00104C0C
+SVC 0x23 CloseHandle  R0=0xFFFF8001 R1=0xFFFF8001 R2=0x0FAFFFEC R3=0x00000001  PC=0x00104C14
+SVC 0xAFFFE8 Unknown  R0=0x00000000 R1=0xFFFF8001 R2=0x0FAFFFEC R3=0x00000001  PC=0x0FAFFFE0
+SVC 0xAFFFE8 Unknown (stub) at PC 0x0FAFFFE0
+Stack Execution Detected - Probable Crash  PC=0x0FFFF000  LR(R14)=0x00104BF8  SP(R13)=0x0FAFFFF8
+Stack Execution Detected - Probable Crash  PC=0x0FFFF000  LR(R14)=0x00104BF8  SP(R13)=0x0FAFFFF8
+Emulation stopped at frame 14 (SVC returned stop)

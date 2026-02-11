@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(nedobEMU LANGUAGES CXX)
+project(nedobEMU LANGUAGES CXX C)
 
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 23)
@@ -37,6 +37,9 @@ endif()
 file(GLOB_RECURSE SOURCES "src/*.cpp")
 file(GLOB_RECURSE HEADERS "src/*.hpp")
 
+# AES for NCCH decryption (C)
+list(APPEND SOURCES "${CMAKE_SOURCE_DIR}/vendored/tiny_aes/aes.c")
+
 # Create your game executable target (console application)
 add_executable(NedobEMU ${SOURCES} ${HEADERS})
 
@@ -52,5 +55,8 @@ endif()
 # Link to SDL3 library
 target_link_libraries(NedobEMU PRIVATE SDL3::SDL3)
 
-# Include SDL3 headers
-target_include_directories(NedobEMU PRIVATE "${SDL3_INCLUDE_DIR}")
+# Include directories
+target_include_directories(NedobEMU PRIVATE
+    "${SDL3_INCLUDE_DIR}"
+    "${CMAKE_SOURCE_DIR}/vendored/tiny_aes"
+)

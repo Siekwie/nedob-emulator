@@ -3,7 +3,7 @@
 #include <SDL3/SDL.h>
 #include <memory>
 #include <string>
-#include "../cores/3ds/ThreeDsCore.hpp"
+#include "../core/3ds/ThreeDsCore.hpp"
 
 class Application {
 public:

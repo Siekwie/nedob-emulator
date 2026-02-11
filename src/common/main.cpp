@@ -7,21 +7,21 @@
 #include "../file_selector/file_selector.hpp"
 #include "../file_selector/rom_type.hpp"
 #include "application.hpp"
+#include "logger.hpp"
 #include <cstdio>
 #include <string>
 
 int main(int argc, char* argv[])
 {
-    // Tell SDL we're handling the main function ourselves
     SDL_SetMainReady();
-    
-    // Initialize SDL with video and audio subsystems
+    Logger::init();
+
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
         const char* error = SDL_GetError();
         if (error && error[0] != '\0') {
-            std::fprintf(stderr, "SDL_Init failed: %s\n", error);
+            Logger::log("SDL_Init failed: %s\n", error);
         } else {
-            std::fprintf(stderr, "SDL_Init failed: Unknown error (error string was empty)\n");
+            Logger::log("SDL_Init failed: Unknown error (error string was empty)\n");
         }
         return 1;
     }
@@ -35,13 +35,13 @@ int main(int argc, char* argv[])
     );
     
     if (!window) {
-        std::fprintf(stderr, "Failed to create window: %s\n", SDL_GetError());
+        Logger::log("Failed to create window: %s\n", SDL_GetError());
         SDL_Quit();
         return 1;
     }
 
-    std::printf("Nedob Emulator - ROM Selector\n");
-    std::printf("Select a ROM file to load...\n");
+    Logger::logInfo("Nedob Emulator - ROM Selector\n");
+    Logger::logInfo("Select a ROM file to load...\n");
 
     // Create file selector
     // file selector will load rom into emulator
@@ -78,18 +78,18 @@ int main(int argc, char* argv[])
 
     // Process the ROM selection result
     if (result.error) {
-        std::fprintf(stderr, "Error selecting ROM file: %s\n", SDL_GetError());
+        Logger::log("Error selecting ROM file: %s\n", SDL_GetError());
         SDL_DestroyWindow(window);
         SDL_Quit();
         return 1;
     } else if (result.cancelled) {
-        std::printf("ROM selection cancelled.\n");
+        Logger::logInfo("ROM selection cancelled.\n");
         SDL_DestroyWindow(window);
         SDL_Quit();
         return 0;
     } else if (!result.filepath.empty()) {
-        std::printf("Selected ROM: %s\n", result.filepath.c_str());
-        std::printf("ROM Type: %s\n", romTypeToString(result.rom_type));
+        Logger::logInfo("Selected ROM: %s\n", result.filepath.c_str());
+        Logger::logInfo("ROM Type: %s\n", romTypeToString(result.rom_type));
         
         // Close the selector window - we'll create a new one in the application
         SDL_DestroyWindow(window);
@@ -101,7 +101,7 @@ int main(int argc, char* argv[])
                 core_type = "3ds";
                 break;
             default:
-                std::fprintf(stderr, "Warning: Unknown ROM type, attempting 3DS core\n");
+                Logger::log("Warning: Unknown ROM type, attempting 3DS core\n");
                 core_type = "3ds";
                 break;
         }
@@ -109,28 +109,23 @@ int main(int argc, char* argv[])
         // Create and initialize the application
         Application app;
         if (!app.initialize()) {
-            std::fprintf(stderr, "Failed to initialize application\n");
+            Logger::log("Failed to initialize application\n");
             SDL_Quit();
             return 1;
         }
         
-        // Load the ROM
         if (!app.loadROM(result.filepath, core_type)) {
-            std::fprintf(stderr, "Failed to load ROM\n");
+            Logger::log("Failed to load ROM\n");
             SDL_Quit();
             return 1;
         }
         
-        // Run the emulator
-        std::printf("Starting emulation...\n");
-        
+        Logger::logInfo("Starting emulation...\n");
         app.run();
-        
-        std::printf("Emulation ended.\n");
+        Logger::logInfo("Emulation ended.\n");
     }
 
-    // Cleanup
+    Logger::shutdown();
     SDL_Quit();
-
     return 0;
 }
