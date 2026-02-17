@@ -1,3 +1,5 @@
 .cache
 .vscode
 /build
+/build_local
+/build_agent
