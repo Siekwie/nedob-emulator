@@ -1,0 +1,8 @@
+/home/siekwie/dev/cpp/nedob-emulator/build_local/CMakeFiles/NedobEMU.dir
+/home/siekwie/dev/cpp/nedob-emulator/build_local/CMakeFiles/edit_cache.dir
+/home/siekwie/dev/cpp/nedob-emulator/build_local/CMakeFiles/rebuild_cache.dir
+/home/siekwie/dev/cpp/nedob-emulator/build_local/vendored/SDL/CMakeFiles/SDL3-shared.dir
+/home/siekwie/dev/cpp/nedob-emulator/build_local/vendored/SDL/CMakeFiles/SDL3_test.dir
+/home/siekwie/dev/cpp/nedob-emulator/build_local/vendored/SDL/CMakeFiles/SDL_uclibc.dir
+/home/siekwie/dev/cpp/nedob-emulator/build_local/vendored/SDL/CMakeFiles/edit_cache.dir
+/home/siekwie/dev/cpp/nedob-emulator/build_local/vendored/SDL/CMakeFiles/rebuild_cache.dir
