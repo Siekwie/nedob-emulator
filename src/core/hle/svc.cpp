@@ -16,6 +16,23 @@ std::string readStringFromMemory(MemorySystem& mem, u32 ptr) {
     return s;
 }
 
+// Minimal helpers for common 3DS ABI structs.
+// 3DS `svcQueryMemory` writes:
+//   MemoryInfo { u32 base; u32 size; u32 perm; u32 state; }  (16 bytes)
+//   PageInfo   { u32 flags; }                               (4 bytes)
+static void writeMemoryInfo(MemorySystem& mem, u32 out_meminfo, u32 base, u32 size, u32 perm, u32 state) {
+    if (out_meminfo == 0) return;
+    mem.write32(out_meminfo + 0, base);
+    mem.write32(out_meminfo + 4, size);
+    mem.write32(out_meminfo + 8, perm);
+    mem.write32(out_meminfo + 12, state);
+}
+
+static void writePageInfo(MemorySystem& mem, u32 out_pageinfo, u32 flags) {
+    if (out_pageinfo == 0) return;
+    mem.write32(out_pageinfo, flags);
+}
+
 const char* getSvcName(u32 n) {
     static const char* names[] = {
         "Unknown",          "ControlMemory",    "QueryMemory",      "ExitProcess",
@@ -92,6 +109,97 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
                         cpu.state().r[0], cpu.state().r[1], cpu.state().r[2], cpu.state().r[3]);
             cpu.state().r[0] = 0;
             return true;
+        case 0x02: {
+            // QueryMemory(MemoryInfo* out, u32* out_pageinfo, u32 addr)
+            // A lot of userland (crt0/libc/rtld) expects these outputs to be initialized.
+            const u32 out_meminfo = cpu.state().r[0];
+            const u32 out_pageinfo = cpu.state().r[1];
+            const u32 addr = cpu.state().r[2];
+
+            // Permissions: bitmask like {R=1, W=2, X=4}. State is "committed" vs "free".
+            constexpr u32 PERM_NONE = 0;
+            constexpr u32 PERM_R = 1;
+            constexpr u32 PERM_W = 2;
+            constexpr u32 PERM_X = 4;
+            constexpr u32 STATE_FREE = 0;
+            constexpr u32 STATE_COMMITTED = 1;
+
+            // Default: unmapped 4KB page.
+            u32 base = addr & ~0xFFFu;
+            u32 size = 0x1000u;
+            u32 perm = PERM_NONE;
+            u32 state = STATE_FREE;
+
+            auto set_region = [&](u32 region_base, u32 region_end) {
+                base = region_base;
+                size = region_end - region_base;
+                if (size == 0) size = 0x1000u;
+            };
+
+            // Mark our user regions as committed so allocators/probers behave. Return
+            // sensible region sizes so code that does `addr += size` doesn't end up
+            // walking a 4KB-at-a-time loop across gigabytes of space.
+            if (addr >= STACK_TLS_VADDR && addr < STACK_TLS_VADDR_END) {
+                perm = PERM_R | PERM_W;
+                state = STATE_COMMITTED;
+                set_region(STACK_TLS_VADDR, STACK_TLS_VADDR_END);
+            } else if (addr >= STACK_REGION_VADDR && addr < STACK_REGION_VADDR_END) {
+                perm = PERM_R | PERM_W;
+                state = STATE_COMMITTED;
+                set_region(STACK_REGION_VADDR, STACK_REGION_VADDR_END);
+            } else if (addr >= SHARED_PAGE_VADDR && addr < SHARED_PAGE_VADDR_END) {
+                perm = PERM_R | PERM_W;
+                state = STATE_COMMITTED;
+                set_region(SHARED_PAGE_VADDR, SHARED_PAGE_VADDR_END);
+            } else if (addr >= SYSTEM_INFO_VADDR && addr < SYSTEM_INFO_VADDR_END) {
+                perm = PERM_R;
+                state = STATE_COMMITTED;
+                set_region(SYSTEM_INFO_VADDR, SYSTEM_INFO_VADDR_END);
+            } else if (addr >= IO_STUB_VADDR && addr < IO_STUB_VADDR_END) {
+                perm = PERM_R | PERM_W;
+                state = STATE_COMMITTED;
+                set_region(IO_STUB_VADDR, IO_STUB_VADDR_END);
+            } else if (addr >= IO_AREA_VADDR && addr < IO_AREA_VADDR_END) {
+                // We currently stub IO reads as 0 and ignore writes, but report the region as present.
+                perm = PERM_R | PERM_W;
+                state = STATE_COMMITTED;
+                set_region(IO_AREA_VADDR, IO_AREA_VADDR_END);
+            } else if (addr >= VRAM_VADDR && addr < VRAM_VADDR_END) {
+                perm = PERM_R | PERM_W;
+                state = STATE_COMMITTED;
+                set_region(VRAM_VADDR, VRAM_VADDR_END);
+            } else if (addr >= VRAM_MIRROR_VADDR && addr < VRAM_MIRROR_VADDR_END) {
+                perm = PERM_R | PERM_W;
+                state = STATE_COMMITTED;
+                set_region(VRAM_MIRROR_VADDR, VRAM_MIRROR_VADDR_END);
+            } else if (addr >= LINEAR_HEAP_VADDR && addr < LINEAR_HEAP_VADDR_END) {
+                perm = PERM_R | PERM_W;
+                state = STATE_COMMITTED;
+                set_region(LINEAR_HEAP_VADDR, LINEAR_HEAP_VADDR_END);
+            } else if (addr >= SHARED_MEMORY_VADDR && addr < SHARED_MEMORY_VADDR_END) {
+                perm = PERM_R | PERM_W;
+                state = STATE_COMMITTED;
+                set_region(SHARED_MEMORY_VADDR, SHARED_MEMORY_VADDR_END);
+            } else if (addr >= HEAP_VADDR && addr < HEAP_VADDR_END) {
+                perm = PERM_R | PERM_W;
+                state = STATE_COMMITTED;
+                set_region(HEAP_VADDR, HEAP_VADDR_END);
+            } else if (addr >= PROCESS_IMAGE_VADDR && addr < PROCESS_IMAGE_VADDR_END) {
+                perm = PERM_R | PERM_X;
+                state = STATE_COMMITTED;
+                set_region(PROCESS_IMAGE_VADDR, PROCESS_IMAGE_VADDR_END);
+            } else if (addr < PROCESS_MEMORY_VADDR_END) {
+                // Flat process memory mapping: treat as committed RW by default.
+                perm = PERM_R | PERM_W;
+                state = STATE_COMMITTED;
+                set_region(0, PROCESS_MEMORY_VADDR_END);
+            }
+
+            writeMemoryInfo(cpu.memory_, out_meminfo, base, size, perm, state);
+            writePageInfo(cpu.memory_, out_pageinfo, 0);
+            cpu.state().r[0] = 0;
+            return true;
+        }
         case 0x38: {
             // GetResourceLimit: return kernel pseudo-handle 0xFFFF8001 (process resource limit). Do not use handle table.
             constexpr u32 RESOURCE_LIMIT_PSEUDO_HANDLE = 0xFFFF8001u;
@@ -184,6 +292,41 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
         case 0x28:
             cpu.state().r[0] = 0;
             return true;
+        case 0x2A: {
+            // GetSystemInfo(u64* out, u32 type, u32 param)
+            // Minimal values to keep userland from branching into error paths.
+            const u32 out_ptr = cpu.state().r[0];
+            const u32 type = cpu.state().r[1];
+            const u32 param = cpu.state().r[2];
+            (void)param;
+
+            // Most callers treat unknown types as 0. Provide a couple common ones.
+            u64 value = 0;
+            // 0x10000: system model (0 = Old 3DS). Keep default.
+            if (type == 0x10000u) value = 0;
+            // 0x20000: kernel version. Use a non-zero placeholder.
+            if (type == 0x20000u) value = 0x0000000200000000ULL;
+
+            if (out_ptr != 0) cpu.memory_.write64(out_ptr, value);
+            cpu.state().r[0] = 0;
+            return true;
+        }
+        case 0x2B: {
+            // GetProcessInfo(u64* out, Handle process, u32 type)
+            const u32 out_ptr = cpu.state().r[0];
+            const u32 process_handle = cpu.state().r[1];
+            const u32 type = cpu.state().r[2];
+            (void)process_handle;
+
+            // Keep it conservative: return 0 for unknown types, but do write the output.
+            u64 value = 0;
+            // type 0 is commonly used for "process ID" or similar metadata in some runtimes;
+            // return a stable non-zero to avoid divide-by-zero / sentinel checks.
+            if (type == 0) value = 0x0000000000000008ULL;
+            if (out_ptr != 0) cpu.memory_.write64(out_ptr, value);
+            cpu.state().r[0] = 0;
+            return true;
+        }
         case 0x3C: {
             const auto& r = cpu.state().r;
             Logger::log("Kernel Break hit!  R0=0x%08X R1=0x%08X R2=0x%08X R3=0x%08X R4=0x%08X R5=0x%08X R6=0x%08X R7=0x%08X R8=0x%08X R9=0x%08X R10=0x%08X R11=0x%08X R12=0x%08X SP=0x%08X LR=0x%08X PC=0x%08X\n",

@@ -9,7 +9,9 @@ namespace {
 
 // Off by default; set to true only when debugging (e.g. after SVC to trace next instructions).
 static bool s_log_reg_writes = false;
-static bool s_trace_enabled = false;
+static bool s_trace_enabled = true;
+static int s_trace_remaining = -1;
+static bool s_trace_done = false;
 
 void logRegWrite(u32 reg, u32 value, u32 pc) {
     if (s_log_reg_writes && reg <= 14)
@@ -18,8 +20,11 @@ void logRegWrite(u32 reg, u32 value, u32 pc) {
 
 constexpr u32 STACK_TRACE_LO = 0x0F000000u;
 constexpr u32 STACK_TRACE_HI = 0x10000000u;
+constexpr u32 CPSR_T = (1u << 5);  // Thumb state bit
 
 void logStackRegionWrite(u32 addr, u32 value, u32 sp, u32 pc) {
+    // Stack writes are extremely frequent; only log during an active trace window.
+    if (!(s_trace_enabled && s_trace_remaining >= 0)) return;
     if (addr >= STACK_TRACE_LO && addr < STACK_TRACE_HI)
         Logger::log("Stack write addr=0x%08X value=0x%08X SP(R13)=0x%08X PC=0x%08X\n", addr, value, sp, pc);
 }
@@ -86,10 +91,9 @@ inline int32_t signExtend24(u32 v) {
 }
 
 // Trace: log next N instructions when PC hits either trigger (loop at 0x00100004 / 0x001045B4).
-constexpr u32 TRACE_TRIGGER_PC = 0x0010003Cu;
-constexpr u32 TRACE_TRIGGER_PC_LOOP = 0x001045B4u;
-constexpr int TRACE_INSTRUCTION_COUNT = 20;
-static int s_trace_remaining = -1;
+constexpr u32 TRACE_TRIGGER_PC = 0x001069CCu;
+constexpr u32 TRACE_TRIGGER_PC_LOOP = 0x001069D0u;
+constexpr int TRACE_INSTRUCTION_COUNT = 48;
 
 void logArmDisasm(u32 pc, u32 inst, int index, bool is_trigger_pc,
                   const u32* r, u32 cpsr) {
@@ -272,16 +276,460 @@ u64 ArmInterpreter::runSliceWithCycles(u64 cycles_limit) {
 
 bool ArmInterpreter::execute() {
     const u32 pc = state_.r[15];
+    // Feed the memory system with best-effort PC context so unmapped accesses can be attributed.
+    memory_.setCurrentAccessPC(pc);
     if (pc >= 0x0FFFF000u && pc < 0x10000000u) {
         Logger::log("Stack Execution Detected - Probable Crash  PC=0x%08X  LR(R14)=0x%08X  SP(R13)=0x%08X\n",
                     pc, state_.r[14], state_.r[13]);
         return false;
     }
+
+    // Thumb state: minimal Thumb-16 support (enough to get through common veneers/trampolines).
+    // The 3DS userland binaries do use interworking, so we must honor CPSR.T on BX/BLX.
+    if ((state_.cpsr & CPSR_T) != 0) {
+        const u16 inst16 = memory_.read16(pc);
+
+        // Thumb-2 32-bit BL (immediate): first halfword 11110 S imm10, second halfword 11111 J1 J2 imm11.
+        // We only implement BL here (not BLX), enough to get through common veneers.
+        if ((inst16 & 0xF800u) == 0xF000u) {
+            const u16 inst16b = memory_.read16(pc + 2u);
+            if ((inst16b & 0xF800u) == 0xF800u) {
+                const u32 s = (inst16 >> 10) & 1u;
+                const u32 imm10 = inst16 & 0x03FFu;
+                const u32 j1 = (inst16b >> 13) & 1u;
+                const u32 j2 = (inst16b >> 11) & 1u;
+                const u32 imm11 = inst16b & 0x07FFu;
+                const u32 i1 = (~(j1 ^ s)) & 1u;
+                const u32 i2 = (~(j2 ^ s)) & 1u;
+                u32 off = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1);
+                // Sign-extend from bit24.
+                if (s) off |= 0xFF000000u;
+                const u32 next = pc + 4u;
+                state_.r[14] = next | 1u;
+                state_.r[15] = (next + off) & ~1u;
+                return true;
+            }
+        }
+
+        // Shift by immediate (Thumb-1): 000 op imm5 Rm Rd
+        // op: 00=LSL, 01=LSR, 10=ASR
+        if ((inst16 & 0xE000u) == 0x0000u) {
+            const u32 op = (inst16 >> 11) & 0x3u;
+            const u32 imm5 = (inst16 >> 6) & 0x1Fu;
+            const u32 rm = (inst16 >> 3) & 0x7u;
+            const u32 rd = inst16 & 0x7u;
+            const u32 val = state_.r[rm];
+            const bool old_v = (state_.cpsr & CpsrFlags::V) != 0;
+            const bool old_c = (state_.cpsr & CpsrFlags::C) != 0;
+            u32 result = val;
+            bool carry = old_c;
+            if (op == 0) {
+                // LSL
+                if (imm5 != 0) {
+                    carry = ((val >> (32u - imm5)) & 1u) != 0;
+                    result = val << imm5;
+                }
+            } else if (op == 1) {
+                // LSR (imm5==0 => shift by 32)
+                const u32 shift = (imm5 == 0) ? 32u : imm5;
+                carry = ((val >> (shift - 1u)) & 1u) != 0;
+                result = (shift == 32u) ? 0u : (val >> shift);
+            } else if (op == 2) {
+                // ASR (imm5==0 => shift by 32)
+                const u32 shift = (imm5 == 0) ? 32u : imm5;
+                carry = ((val >> (shift - 1u)) & 1u) != 0;
+                result = static_cast<u32>(static_cast<s32>(val) >> (shift == 32u ? 31u : shift));
+            } else {
+                // op==3 is "add/sub" group; let other decoders handle it.
+                goto thumb_unknown;
+            }
+            state_.r[rd] = result;
+            const bool n = (result & 0x80000000u) != 0;
+            const bool z = (result == 0);
+            setCpsrFlags(state_.cpsr, n, z, carry, old_v);
+            state_.r[15] = pc + 2u;
+            return true;
+        }
+
+        // ALU operations (Thumb-1): 010000 op Rs Rd
+        if ((inst16 & 0xFC00u) == 0x4000u) {
+            const u32 op = (inst16 >> 6) & 0xFu;
+            const u32 rs = (inst16 >> 3) & 0x7u;
+            const u32 rd = inst16 & 0x7u;
+            const u32 a = state_.r[rd];
+            const u32 b = state_.r[rs];
+            const bool old_c = (state_.cpsr & CpsrFlags::C) != 0;
+            const bool old_v = (state_.cpsr & CpsrFlags::V) != 0;
+
+            auto set_nz_keepcv = [&](u32 r) {
+                const bool n = (r & 0x80000000u) != 0;
+                const bool z = (r == 0);
+                setCpsrFlags(state_.cpsr, n, z, old_c, old_v);
+            };
+
+            auto set_nzcv = [&](u32 r, bool c, bool v) {
+                const bool n = (r & 0x80000000u) != 0;
+                const bool z = (r == 0);
+                setCpsrFlags(state_.cpsr, n, z, c, v);
+            };
+
+            switch (op) {
+                case 0x0: { // AND
+                    const u32 r = a & b;
+                    state_.r[rd] = r;
+                    set_nz_keepcv(r);
+                    break;
+                }
+                case 0x1: { // EOR
+                    const u32 r = a ^ b;
+                    state_.r[rd] = r;
+                    set_nz_keepcv(r);
+                    break;
+                }
+                case 0x2: { // LSL (register)
+                    const u32 shift = b & 0xFFu;
+                    u32 r = a;
+                    bool c = old_c;
+                    if (shift != 0) {
+                        if (shift < 32u) {
+                            c = ((a >> (32u - shift)) & 1u) != 0;
+                            r = a << shift;
+                        } else if (shift == 32u) {
+                            c = (a & 1u) != 0;
+                            r = 0;
+                        } else {
+                            c = false;
+                            r = 0;
+                        }
+                    }
+                    state_.r[rd] = r;
+                    set_nzcv(r, c, old_v);
+                    break;
+                }
+                case 0x3: { // LSR (register)
+                    const u32 shift = b & 0xFFu;
+                    u32 r = a;
+                    bool c = old_c;
+                    if (shift != 0) {
+                        if (shift < 32u) {
+                            c = ((a >> (shift - 1u)) & 1u) != 0;
+                            r = a >> shift;
+                        } else if (shift == 32u) {
+                            c = (a >> 31) != 0;
+                            r = 0;
+                        } else {
+                            c = false;
+                            r = 0;
+                        }
+                    }
+                    state_.r[rd] = r;
+                    set_nzcv(r, c, old_v);
+                    break;
+                }
+                case 0x4: { // ASR (register)
+                    const u32 shift = b & 0xFFu;
+                    u32 r = a;
+                    bool c = old_c;
+                    if (shift != 0) {
+                        if (shift < 32u) {
+                            c = ((a >> (shift - 1u)) & 1u) != 0;
+                            r = static_cast<u32>(static_cast<s32>(a) >> shift);
+                        } else {
+                            // shift >= 32: all bits become sign bit
+                            c = (a >> 31) != 0;
+                            r = c ? 0xFFFFFFFFu : 0u;
+                        }
+                    }
+                    state_.r[rd] = r;
+                    set_nzcv(r, c, old_v);
+                    break;
+                }
+                case 0x5: { // ADC
+                    const u32 carry_in = old_c ? 1u : 0u;
+                    const u64 sum = static_cast<u64>(a) + static_cast<u64>(b) + carry_in;
+                    const u32 r = static_cast<u32>(sum);
+                    const bool c = (sum >> 32) != 0;
+                    const bool v = overflowFromAdd(a, b + carry_in, r);
+                    state_.r[rd] = r;
+                    set_nzcv(r, c, v);
+                    break;
+                }
+                case 0x6: { // SBC: a - b - (1-C)
+                    const u32 borrow = old_c ? 0u : 1u;
+                    const u64 sub = static_cast<u64>(a) - static_cast<u64>(b) - borrow;
+                    const u32 r = static_cast<u32>(sub);
+                    const bool c = static_cast<u64>(a) >= (static_cast<u64>(b) + borrow);
+                    const bool v = overflowFromSub(a, b + borrow, r);
+                    state_.r[rd] = r;
+                    set_nzcv(r, c, v);
+                    break;
+                }
+                case 0x7: { // ROR (register)
+                    const u32 shift = b & 0xFFu;
+                    u32 r = a;
+                    bool c = old_c;
+                    if (shift != 0) {
+                        const u32 s = shift & 31u;
+                        if (s == 0) {
+                            r = a;
+                            c = (a >> 31) != 0;
+                        } else {
+                            r = (a >> s) | (a << (32u - s));
+                            c = (r >> 31) != 0;
+                        }
+                    }
+                    state_.r[rd] = r;
+                    set_nzcv(r, c, old_v);
+                    break;
+                }
+                case 0x8: { // TST
+                    const u32 r = a & b;
+                    set_nz_keepcv(r);
+                    break;
+                }
+                case 0x9: { // NEG: 0 - b
+                    const u32 r = 0u - b;
+                    const bool c = (b == 0);
+                    const bool v = overflowFromSub(0u, b, r);
+                    state_.r[rd] = r;
+                    set_nzcv(r, c, v);
+                    break;
+                }
+                case 0xA: { // CMP
+                    const u32 r = a - b;
+                    const bool c = a >= b;
+                    const bool v = overflowFromSub(a, b, r);
+                    set_nzcv(r, c, v);
+                    break;
+                }
+                case 0xB: { // CMN
+                    const u32 r = a + b;
+                    const bool c = carryFromAdd(a, b, r);
+                    const bool v = overflowFromAdd(a, b, r);
+                    set_nzcv(r, c, v);
+                    break;
+                }
+                case 0xC: { // ORR
+                    const u32 r = a | b;
+                    state_.r[rd] = r;
+                    set_nz_keepcv(r);
+                    break;
+                }
+                case 0xD: { // MUL
+                    const u32 r = a * b;
+                    state_.r[rd] = r;
+                    // C/V are architecturally "unpredictable" here; keep them stable.
+                    set_nz_keepcv(r);
+                    break;
+                }
+                case 0xE: { // BIC
+                    const u32 r = a & ~b;
+                    state_.r[rd] = r;
+                    set_nz_keepcv(r);
+                    break;
+                }
+                case 0xF: { // MVN
+                    const u32 r = ~b;
+                    state_.r[rd] = r;
+                    set_nz_keepcv(r);
+                    break;
+                }
+                default:
+                    goto thumb_unknown;
+            }
+
+            state_.r[15] = pc + 2u;
+            return true;
+        }
+
+        // MOV/CMP/ADD/SUB (immediate, Thumb-1):
+        // 00100 Rd imm8  (MOVS)
+        // 00101 Rn imm8  (CMP)
+        // 00110 Rd imm8  (ADDS)
+        // 00111 Rd imm8  (SUBS)
+        if ((inst16 & 0xF800u) == 0x2000u || (inst16 & 0xF800u) == 0x2800u ||
+            (inst16 & 0xF800u) == 0x3000u || (inst16 & 0xF800u) == 0x3800u) {
+            const u32 op = (inst16 >> 11) & 0x3u;
+            const u32 rd = (inst16 >> 8) & 0x7u;
+            const u32 imm8 = inst16 & 0xFFu;
+            const u32 a = state_.r[rd];
+            const bool old_c = (state_.cpsr & CpsrFlags::C) != 0;
+            const bool old_v = (state_.cpsr & CpsrFlags::V) != 0;
+            auto set_nz_keepcv = [&](u32 r) {
+                const bool n = (r & 0x80000000u) != 0;
+                const bool z = (r == 0);
+                setCpsrFlags(state_.cpsr, n, z, old_c, old_v);
+            };
+            auto set_nzcv = [&](u32 r, bool c, bool v) {
+                const bool n = (r & 0x80000000u) != 0;
+                const bool z = (r == 0);
+                setCpsrFlags(state_.cpsr, n, z, c, v);
+            };
+            if (op == 0) { // MOVS
+                state_.r[rd] = imm8;
+                set_nz_keepcv(imm8);
+            } else if (op == 1) { // CMP
+                const u32 r = a - imm8;
+                const bool c = a >= imm8;
+                const bool v = overflowFromSub(a, imm8, r);
+                set_nzcv(r, c, v);
+            } else if (op == 2) { // ADDS
+                const u32 r = a + imm8;
+                const bool c = carryFromAdd(a, imm8, r);
+                const bool v = overflowFromAdd(a, imm8, r);
+                state_.r[rd] = r;
+                set_nzcv(r, c, v);
+            } else { // SUBS
+                const u32 r = a - imm8;
+                const bool c = a >= imm8;
+                const bool v = overflowFromSub(a, imm8, r);
+                state_.r[rd] = r;
+                set_nzcv(r, c, v);
+            }
+            state_.r[15] = pc + 2u;
+            return true;
+        }
+
+        // BX/BLX (register): 010001 11 H:Rm 000
+        // Encoding for BX Rm is 0x4700 | (Rm << 3). BLX is 0x4780 | (Rm << 3).
+        if ((inst16 & 0xFF87u) == 0x4700u) {
+            const bool is_blx = (inst16 & 0x0080u) != 0;
+            const u32 rm = (inst16 >> 3) & 0xFu;
+            const u32 target = state_.r[rm];
+            if (is_blx) {
+                // In Thumb state, LR gets the address of the next instruction with bit0 set.
+                state_.r[14] = (pc + 2u) | 1u;
+            }
+            if ((target & 1u) != 0) state_.cpsr |= CPSR_T;
+            else state_.cpsr &= ~CPSR_T;
+            state_.r[15] = target & ~1u;
+            return true;
+        }
+
+        // PUSH/POP (Thumb-1): 1011 0 10 M reglist (PUSH) / 1011 1 10 P reglist (POP)
+        // PUSH uses SP and optionally LR; POP optionally loads PC.
+        if ((inst16 & 0xFE00u) == 0xB400u) {
+            const bool include_lr = (inst16 & 0x0100u) != 0;
+            const u32 reglist = inst16 & 0x00FFu;
+            int count = 0;
+            for (u32 i = 0; i < 8; ++i) if (reglist & (1u << i)) ++count;
+            if (include_lr) ++count;
+            if (count == 0) {
+                state_.r[15] = pc + 2u;
+                return true;
+            }
+            u32 sp = state_.r[13];
+            u32 addr = sp - 4u * static_cast<u32>(count);
+            u32 cur = addr;
+            for (u32 i = 0; i < 8; ++i) {
+                if (!(reglist & (1u << i))) continue;
+                logStackRegionWrite(cur, state_.r[i], state_.r[13], state_.r[15]);
+                memory_.write32(cur, state_.r[i]);
+                cur += 4;
+            }
+            if (include_lr) {
+                logStackRegionWrite(cur, state_.r[14], state_.r[13], state_.r[15]);
+                memory_.write32(cur, state_.r[14]);
+                cur += 4;
+            }
+            state_.r[13] = addr;
+            state_.r[15] = pc + 2u;
+            return true;
+        }
+        if ((inst16 & 0xFE00u) == 0xBC00u) {
+            const bool include_pc = (inst16 & 0x0100u) != 0;
+            const u32 reglist = inst16 & 0x00FFu;
+            int count = 0;
+            for (u32 i = 0; i < 8; ++i) if (reglist & (1u << i)) ++count;
+            if (include_pc) ++count;
+            if (count == 0) {
+                state_.r[15] = pc + 2u;
+                return true;
+            }
+            u32 sp = state_.r[13];
+            u32 addr = sp;
+            for (u32 i = 0; i < 8; ++i) {
+                if (!(reglist & (1u << i))) continue;
+                state_.r[i] = memory_.read32(addr);
+                addr += 4;
+            }
+            if (include_pc) {
+                const u32 value = memory_.read32(addr);
+                addr += 4;
+                if ((value & 1u) != 0) state_.cpsr |= CPSR_T;
+                else state_.cpsr &= ~CPSR_T;
+                state_.r[15] = value & ~1u;
+            } else {
+                state_.r[15] = pc + 2u;
+            }
+            state_.r[13] = sp + 4u * static_cast<u32>(count);
+            return true;
+        }
+
+        // STMIA/LDMIA (Thumb-1): 1100 L Rn reglist
+        if ((inst16 & 0xF000u) == 0xC000u) {
+            const bool load = (inst16 & 0x0800u) != 0;
+            const u32 rn = (inst16 >> 8) & 0x7u;
+            const u32 reglist = inst16 & 0x00FFu;
+            u32 addr = state_.r[rn];
+            int count = 0;
+            for (u32 i = 0; i < 8; ++i) if (reglist & (1u << i)) ++count;
+            if (count == 0) {
+                state_.r[15] = pc + 2u;
+                return true;
+            }
+            if (load) {
+                for (u32 i = 0; i < 8; ++i) {
+                    if (!(reglist & (1u << i))) continue;
+                    state_.r[i] = memory_.read32(addr);
+                    addr += 4;
+                }
+            } else {
+                for (u32 i = 0; i < 8; ++i) {
+                    if (!(reglist & (1u << i))) continue;
+                    logStackRegionWrite(addr, state_.r[i], state_.r[13], state_.r[15]);
+                    memory_.write32(addr, state_.r[i]);
+                    addr += 4;
+                }
+            }
+            state_.r[rn] = state_.r[rn] + 4u * static_cast<u32>(count);
+            state_.r[15] = pc + 2u;
+            return true;
+        }
+
+        // B (unconditional, Thumb-1): 11100 imm11
+        if ((inst16 & 0xF800u) == 0xE000u) {
+            const u32 imm11 = inst16 & 0x07FFu;
+            // Sign-extend imm11<<1 from 12 bits.
+            u32 off = imm11 << 1;
+            if (off & 0x800u) off |= 0xFFFFF000u;
+            state_.r[15] = pc + 4u + off;
+            return true;
+        }
+
+        // B<cond> (Thumb-1): 1101 cond imm8 (cond != 0xF)
+        if ((inst16 & 0xF000u) == 0xD000u && (inst16 & 0x0F00u) != 0x0F00u) {
+            const u32 cond4 = (inst16 >> 8) & 0xFu;
+            const u32 imm8 = inst16 & 0xFFu;
+            u32 off = imm8 << 1;
+            if (off & 0x100u) off |= 0xFFFFFE00u;  // sign extend from 9 bits
+            if (conditionPassed(cond4, state_.cpsr)) state_.r[15] = pc + 4u + off;
+            else state_.r[15] = pc + 2u;
+            return true;
+        }
+
+thumb_unknown:
+        Logger::log("THUMB: unknown opcode 0x%04X at PC 0x%08X\n", inst16, pc);
+        return false;
+    }
+
     const u32 inst = fetch32();
     const u32 cond_bits = cond(inst);
 
-    if (s_trace_enabled && (pc == TRACE_TRIGGER_PC || pc == TRACE_TRIGGER_PC_LOOP) && s_trace_remaining < 0) {
+    if (s_trace_enabled && !s_trace_done &&
+        (pc == TRACE_TRIGGER_PC || pc == TRACE_TRIGGER_PC_LOOP) && s_trace_remaining < 0) {
         s_trace_remaining = TRACE_INSTRUCTION_COUNT;
+        s_trace_done = true;
         Logger::log("=== Trace: next %d instructions. State shown is BEFORE each instruction runs. ===\n", TRACE_INSTRUCTION_COUNT);
     }
     if (s_trace_enabled && s_trace_remaining >= 0) {
@@ -303,6 +751,41 @@ bool ArmInterpreter::execute() {
             state_.r[14] = saved_lr;
             return cont;
         }
+        return true;
+    }
+
+    // CLREX (ARMv7): clear exclusive monitor. Encoding: 0xF57FF01F (unconditional).
+    if (inst == 0xF57FF01Fu) {
+        exclusive_valid_ = false;
+        advancePC();
+        return true;
+    }
+
+    // ARM exclusive access pair (ldrex/strex), used by user-space locks and atomics.
+    if ((inst & 0x0FF00FFFu) == 0x01900F9Fu) {
+        const u32 rn = (inst >> 16) & 0xFu;
+        const u32 rt = (inst >> 12) & 0xFu;
+        const u32 addr = state_.r[rn];
+        const u32 value = memory_.read32(addr);
+        writeReg(rt, value);
+        exclusive_addr_ = addr;
+        exclusive_valid_ = true;
+        advancePC();
+        return true;
+    }
+    if ((inst & 0x0FF00FF0u) == 0x01800F90u) {
+        const u32 rn = (inst >> 16) & 0xFu;
+        const u32 rd = (inst >> 12) & 0xFu;   // status: 0 success, 1 failure
+        const u32 rt = inst & 0xFu;           // value to store
+        const u32 addr = state_.r[rn];
+        if (exclusive_valid_ && exclusive_addr_ == addr) {
+            memory_.write32(addr, state_.r[rt]);
+            writeReg(rd, 0);
+        } else {
+            writeReg(rd, 1);
+        }
+        exclusive_valid_ = false;
+        advancePC();
         return true;
     }
 
@@ -330,7 +813,7 @@ bool ArmInterpreter::execute() {
         const u32 n = (state_.cpsr >> 31) & 1u, z = (state_.cpsr >> 30) & 1u, c = (state_.cpsr >> 29) & 1u, v = (state_.cpsr >> 28) & 1u;
         const int32_t offset_bytes = signExtend24(imm24(inst)) * 4;
         const u32 target = state_.r[15] + 8 + offset_bytes;
-        if (s_trace_enabled && cond_b != COND_AL && cond_b != COND_NV)
+        if (s_trace_enabled && s_trace_remaining >= 0 && cond_b != COND_AL && cond_b != COND_NV)
             Logger::log("  B cond=0x%X %s -> 0x%08X  NZCV=%u%u%u%u\n", cond_b, taken ? "TAKEN" : "not taken", target, n, z, c, v);
         const bool is_bl = (inst & (1u << 24)) != 0;
         if (is_bl)
@@ -375,6 +858,40 @@ bool ArmInterpreter::execute() {
         return true;
     }
 
+    // MRC/MCR coprocessor register transfer (CP15 system + CP10/11 VFP system regs).
+    if ((inst & 0x0F000010u) == 0x0E000010u) {
+        const u32 coproc = (inst >> 8) & 0xFu;
+        const bool is_mrc = ((inst >> 20) & 1u) != 0;
+        const u32 rd = Rd(inst);
+        const u32 crn = (inst >> 16) & 0xFu;
+        const u32 crm = inst & 0xFu;
+        const u32 opc1 = (inst >> 21) & 0x7u;
+        const u32 opc2 = (inst >> 5) & 0x7u;
+        if (coproc == 15u) {
+            if (is_mrc) {
+                u32 value = 0;
+                // MRC p15,0,Rd,c13,c0,3: TPIDRURO (user thread pointer / TLS base).
+                if (crn == 13u && crm == 0u && opc1 == 0u && opc2 == 3u) {
+                    // Use the mapped TLS page (writable) rather than the system-info region.
+                    value = STACK_TLS_VADDR;
+                }
+                writeReg(rd, value);
+            }
+            // For now, ignore CP15 writes (MCR) and return success.
+            advancePC();
+            return true;
+        }
+        if (coproc == 10u || coproc == 11u) {
+            // VFP/NEON system register transfers show up early in crt0/libc.
+            // We don't model VFP state yet; returning 0 and ignoring writes gets us past init code.
+            if (is_mrc) {
+                writeReg(rd, 0);
+            }
+            advancePC();
+            return true;
+        }
+    }
+
     // LDM/STM (bits 27-25 = 100). STMDB: base decremented before each store. LDMIA: load then increment.
     // Writeback: Rn becomes base +/- 4*count; if Rn is last in list for LDM, Rn keeps loaded value.
     if (bits27_25 == 4) {
@@ -395,18 +912,25 @@ bool ArmInterpreter::execute() {
 
         u32 addr;
         if (up) {
-            addr = pre ? (base + 4) : base;                                    // IA: first at base
+            // IA / IB
+            addr = pre ? (base + 4) : base;
         } else {
-            addr = base - 4u * static_cast<u32>(count);                        // DB: first at base-4*count
+            // DA / DB
+            addr = pre
+                ? (base - 4u * static_cast<u32>(count))                        // DB: first at base-4*count
+                : (base - 4u * static_cast<u32>(count - 1));                   // DA: first at base-4*(count-1)
         }
         const u32 writeback_val = up ? (base + 4u * static_cast<u32>(count)) : (base - 4u * static_cast<u32>(count));
+        const bool loads_pc = load && ((list & (1u << 15)) != 0);
 
         if (load) {
             for (u32 i = 0; i < 16; ++i) {
                 if (!(list & (1u << i))) continue;
                 const u32 value = memory_.read32(addr);
                 if (i == 15) {
-                    Logger::log("LDM POP PC: loading value 0x%08X from addr 0x%08X into PC\n", value, addr);
+                    if (s_trace_enabled && s_trace_remaining >= 0) {
+                        Logger::log("LDM POP PC: loading value 0x%08X from addr 0x%08X into PC\n", value, addr);
+                    }
                 }
                 writeReg(i, value);
                 addr += 4;
@@ -435,7 +959,9 @@ bool ArmInterpreter::execute() {
             if (!(list & (1u << rn)) || rn != last_in_list)
                 writeReg(rn, writeback_val);
         }
-        advancePC();
+        if (!loads_pc) {
+            advancePC();
+        }
         return true;
     }
 
@@ -460,12 +986,19 @@ bool ArmInterpreter::execute() {
         if ((inst & MASK_BLX_REG) == 0x012FFF10) {
             const bool is_blx = (inst & (1u << 5)) != 0;
             const u32 rm = Rm(inst);
+            const u32 target = state_.r[rm];
             if (!is_blx && rm == 14) {
-                Logger::log("BX LR: LR=0x%08X -> PC\n", state_.r[14]);
+                // This can be extremely spammy in busy loops; only log during an active trace window.
+                if (s_trace_enabled && s_trace_remaining >= 0) {
+                    Logger::log("BX LR: PC=0x%08X LR=0x%08X -> 0x%08X%s\n",
+                                state_.r[15], state_.r[14], target & ~1u, (target & 1u) ? " (thumb)" : "");
+                }
             }
             if (is_blx)
                 writeReg(14, state_.r[15] + 4);
-            state_.r[15] = state_.r[rm] & ~1u;
+            if ((target & 1u) != 0) state_.cpsr |= CPSR_T;
+            else state_.cpsr &= ~CPSR_T;
+            state_.r[15] = target & ~1u;
             return true;
         }
 
@@ -547,10 +1080,12 @@ bool ArmInterpreter::execute() {
             switch (op1) {
                 case 0x0: result = rn_val & op2_val; break;
                 case 0x1: result = rn_val ^ op2_val; break;
-                case 0x2: result = rn_val + op2_val; break;
-                case 0x3: result = rn_val + op2_val; break;
+                case 0x2: result = rn_val - op2_val; break; // SUB
+                case 0x3: result = op2_val - rn_val; break; // RSB
                 case 0x4: result = rn_val + op2_val; break;
-                case 0x5: result = rn_val - op2_val; break;
+                case 0x5: result = rn_val + op2_val + ((state_.cpsr & CpsrFlags::C) ? 1u : 0u); break; // ADC
+                case 0x6: result = rn_val - op2_val - ((state_.cpsr & CpsrFlags::C) ? 0u : 1u); break; // SBC
+                case 0x7: result = op2_val - rn_val - ((state_.cpsr & CpsrFlags::C) ? 0u : 1u); break; // RSC
                 case 0x8: result = rn_val & op2_val; break;
                 case 0x9: result = rn_val ^ op2_val; break;
                 case 0xA: result = rn_val - op2_val; break;
@@ -558,6 +1093,7 @@ bool ArmInterpreter::execute() {
                 case 0xC: result = rn_val | op2_val; break;
                 case 0xD: result = op2_val; break;
                 case 0xE: result = rn_val & ~op2_val; break;
+                case 0xF: result = ~op2_val; break;
                 default: break;
             }
             // CMP/CMN/TST/TEQ (op1 8,9,A,B) never write to any register; only set flags.
@@ -567,12 +1103,31 @@ bool ArmInterpreter::execute() {
             if (S(inst)) {
                 bool n_flag = (result & 0x80000000u) != 0;
                 bool z_flag = (result == 0u);
-                bool c = isSubtractionOpcode(op1) ? carryFromSub(rn_val, op2_val)
-                         : isAdditionOpcode(op1)  ? carryFromAdd(rn_val, op2_val, result)
-                                                  : ((state_.cpsr & CpsrFlags::C) != 0);
-                bool v = isSubtractionOpcode(op1) ? overflowFromSub(rn_val, op2_val, result)
-                         : isAdditionOpcode(op1)  ? overflowFromAdd(rn_val, op2_val, result)
-                                                  : ((state_.cpsr & CpsrFlags::V) != 0);
+                const bool carry_in = (state_.cpsr & CpsrFlags::C) != 0;
+                bool c = ((state_.cpsr & CpsrFlags::C) != 0);
+                bool v = ((state_.cpsr & CpsrFlags::V) != 0);
+                if (op1 == 0x2 || op1 == 0xA) { // SUB / CMP
+                    c = carryFromSub(rn_val, op2_val);
+                    v = overflowFromSub(rn_val, op2_val, result);
+                } else if (op1 == 0x3) { // RSB
+                    c = carryFromSub(op2_val, rn_val);
+                    v = overflowFromSub(op2_val, rn_val, result);
+                } else if (op1 == 0x4 || op1 == 0xB) { // ADD / CMN
+                    c = carryFromAdd(rn_val, op2_val, result);
+                    v = overflowFromAdd(rn_val, op2_val, result);
+                } else if (op1 == 0x5) { // ADC
+                    const u64 wide = static_cast<u64>(rn_val) + static_cast<u64>(op2_val) + (carry_in ? 1ull : 0ull);
+                    c = (wide >> 32) != 0;
+                    v = overflowFromAdd(rn_val, op2_val + (carry_in ? 1u : 0u), result);
+                } else if (op1 == 0x6) { // SBC
+                    const u64 subtrahend = static_cast<u64>(op2_val) + (carry_in ? 0ull : 1ull);
+                    c = static_cast<u64>(rn_val) >= subtrahend;
+                    v = overflowFromSub(rn_val, op2_val + (carry_in ? 0u : 1u), result);
+                } else if (op1 == 0x7) { // RSC
+                    const u64 subtrahend = static_cast<u64>(rn_val) + (carry_in ? 0ull : 1ull);
+                    c = static_cast<u64>(op2_val) >= subtrahend;
+                    v = overflowFromSub(op2_val, rn_val + (carry_in ? 0u : 1u), result);
+                }
                 setCpsrFlags(state_.cpsr, n_flag, z_flag, c, v);
             }
             advancePC();
@@ -588,10 +1143,14 @@ bool ArmInterpreter::execute() {
             switch (op1) {
                 case 0x0: result = rn_val & op2_val; break;
                 case 0x1: result = rn_val ^ op2_val; break;
-                case 0x2: result = rn_val + op2_val; break;
+                case 0x2: result = rn_val - op2_val; break; // SUB
+                case 0x3: result = op2_val - rn_val; break; // RSB
                 case 0x4: result = rn_val + op2_val; break;
-                case 0x5: result = rn_val - op2_val; break;
+                case 0x5: result = rn_val + op2_val + ((state_.cpsr & CpsrFlags::C) ? 1u : 0u); break; // ADC
+                case 0x6: result = rn_val - op2_val - ((state_.cpsr & CpsrFlags::C) ? 0u : 1u); break; // SBC
+                case 0x7: result = op2_val - rn_val - ((state_.cpsr & CpsrFlags::C) ? 0u : 1u); break; // RSC
                 case 0xA: result = rn_val - op2_val; break;
+                case 0xB: result = rn_val + op2_val; break; // CMN
                 case 0xC: result = rn_val | op2_val; break;
                 case 0xD: result = op2_val; break;
                 case 0xE: result = rn_val & ~op2_val; break;
@@ -604,12 +1163,31 @@ bool ArmInterpreter::execute() {
             if (S(inst)) {
                 bool n_flag = (result & 0x80000000u) != 0;
                 bool z_flag = (result == 0u);
-                bool c = isSubtractionOpcode(op1) ? carryFromSub(rn_val, op2_val)
-                         : isAdditionOpcode(op1)  ? carryFromAdd(rn_val, op2_val, result)
-                                                  : ((state_.cpsr & CpsrFlags::C) != 0);
-                bool v = isSubtractionOpcode(op1) ? overflowFromSub(rn_val, op2_val, result)
-                         : isAdditionOpcode(op1)  ? overflowFromAdd(rn_val, op2_val, result)
-                                                  : ((state_.cpsr & CpsrFlags::V) != 0);
+                const bool carry_in = (state_.cpsr & CpsrFlags::C) != 0;
+                bool c = ((state_.cpsr & CpsrFlags::C) != 0);
+                bool v = ((state_.cpsr & CpsrFlags::V) != 0);
+                if (op1 == 0x2 || op1 == 0xA) { // SUB / CMP
+                    c = carryFromSub(rn_val, op2_val);
+                    v = overflowFromSub(rn_val, op2_val, result);
+                } else if (op1 == 0x3) { // RSB
+                    c = carryFromSub(op2_val, rn_val);
+                    v = overflowFromSub(op2_val, rn_val, result);
+                } else if (op1 == 0x4 || op1 == 0xB) { // ADD / CMN
+                    c = carryFromAdd(rn_val, op2_val, result);
+                    v = overflowFromAdd(rn_val, op2_val, result);
+                } else if (op1 == 0x5) { // ADC
+                    const u64 wide = static_cast<u64>(rn_val) + static_cast<u64>(op2_val) + (carry_in ? 1ull : 0ull);
+                    c = (wide >> 32) != 0;
+                    v = overflowFromAdd(rn_val, op2_val + (carry_in ? 1u : 0u), result);
+                } else if (op1 == 0x6) { // SBC
+                    const u64 subtrahend = static_cast<u64>(op2_val) + (carry_in ? 0ull : 1ull);
+                    c = static_cast<u64>(rn_val) >= subtrahend;
+                    v = overflowFromSub(rn_val, op2_val + (carry_in ? 0u : 1u), result);
+                } else if (op1 == 0x7) { // RSC
+                    const u64 subtrahend = static_cast<u64>(rn_val) + (carry_in ? 0ull : 1ull);
+                    c = static_cast<u64>(op2_val) >= subtrahend;
+                    v = overflowFromSub(op2_val, rn_val + (carry_in ? 0u : 1u), result);
+                }
                 setCpsrFlags(state_.cpsr, n_flag, z_flag, c, v);
             }
             advancePC();

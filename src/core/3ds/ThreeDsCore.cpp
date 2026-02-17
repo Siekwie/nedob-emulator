@@ -42,7 +42,9 @@ bool ThreeDS::loadROM(const std::string& path) {
         });
 
     interpreter_->setPC(load_result.entry_point);
-    interpreter_->setSP(0x0FB00000u);          // R13 = far below TLS (0x0FFFF000), plenty of headroom
+    // Stack grows downward; start at the top of our dedicated stack region.
+    // Using 0x0FB00000 underflows quickly when userland pops small frames.
+    interpreter_->setSP(STACK_REGION_VADDR_END); // R13
     interpreter_->setLR(0);                    // R14 = link register (set by first BL/BLX)
 
     gpu_ = std::make_unique<VideoCore::Gpu>(*memory_);
