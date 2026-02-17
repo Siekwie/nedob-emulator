@@ -163,6 +163,13 @@ public:
     /// Fill first 256 bytes of process memory (PEB at 0x00000000) with boot values; program_id at 0x1C (LE 8 bytes).
     void initProcessEnvironmentBlock(u64 program_id);
 
+    /// Set the current CPU PC for logging context (best-effort; used for unmapped access logs).
+    void setCurrentAccessPC(u32 pc) {
+        current_access_pc_ = pc;
+        has_current_access_pc_ = true;
+    }
+    void clearCurrentAccessPC() { has_current_access_pc_ = false; }
+
     u8 read8(VAddr addr);
     u16 read16(VAddr addr);
     u32 read32(VAddr addr);
@@ -182,6 +189,7 @@ public:
 private:
     bool tryFcram(VAddr addr, std::size_t size, std::size_t& out_offset) const;
     bool tryProcessMemory(VAddr addr, std::size_t size, std::size_t& out_offset) const;
+    bool trySharedMemoryTail(VAddr addr, std::size_t size, std::size_t& out_offset) const;
     bool tryVram(VAddr addr, std::size_t size, std::size_t& out_offset) const;
     bool trySystemInfo(VAddr addr, std::size_t size, std::size_t& out_offset) const;
     bool trySharedPage(VAddr addr, std::size_t size, std::size_t& out_offset) const;
@@ -192,6 +200,7 @@ private:
 
     std::vector<u8> fcram_;
     std::vector<u8> process_memory_;
+    std::vector<u8> shared_memory_tail_;
     std::vector<u8> vram_;
     std::vector<u8> system_info_mem_;
     std::vector<u8> shared_page_;
@@ -199,5 +208,18 @@ private:
     std::vector<u8> tls_mem_;
     std::vector<u8> io_stub_;
     unsigned unmapped_log_count_{0};
-    static constexpr unsigned kMaxUnmappedLogPerFrame = 50;
+    u32 current_access_pc_{0};
+    bool has_current_access_pc_{false};
+
+    // Unmapped-access logging can easily dominate the log and grow it to tens of GB
+    // if some code probes large address ranges. Keep it bounded.
+    u64 unmapped_total_logged_{0};
+    u64 unmapped_total_suppressed_{0};
+    bool unmapped_suppress_notice_printed_{false};
+
+    bool shouldLogUnmapped();
+    void logUnmappedSuppressedOnce();
+
+    static constexpr unsigned kMaxUnmappedLogPerFrame = 8;
+    static constexpr u64 kMaxUnmappedLogTotal = 2000;
 };

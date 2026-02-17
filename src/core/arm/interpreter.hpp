@@ -54,4 +54,6 @@ public:
     MemorySystem& memory_;
     SvcHandler svc_handler_;
     ArmState state_;
+    bool exclusive_valid_{false};
+    u32 exclusive_addr_{0};
 };

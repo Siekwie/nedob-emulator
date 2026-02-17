@@ -10,6 +10,9 @@ constexpr u32 VBLANK_READY_MASK = 0x30000001u;
 MemorySystem::MemorySystem() {
     fcram_.resize(FCRAM_SIZE, 0);
     process_memory_.resize(PROCESS_MEMORY_WITH_VRAM_SIZE, 0);
+    // Shared-memory mapping extends beyond our flat process_memory_ region:
+    // 0x10000000-0x11FFFFFF is in process_memory_, but 0x12000000-0x13FFFFFF is not.
+    shared_memory_tail_.resize(static_cast<std::size_t>(SHARED_MEMORY_VADDR_END - PROCESS_MEMORY_VADDR_END), 0);
     vram_.resize(VRAM_SIZE, 0);
     system_info_mem_.resize(SYSTEM_INFO_SIZE, 0);
     shared_page_.resize(SHARED_PAGE_SIZE, 0);
@@ -25,6 +28,28 @@ MemorySystem::MemorySystem() {
     shared_page_[0x0D] = static_cast<u8>(tick >> 40);
     shared_page_[0x0E] = static_cast<u8>(tick >> 48);
     shared_page_[0x0F] = static_cast<u8>(tick >> 56);
+
+    // Minimal TLS bootstrap:
+    // Some crt0/libc code spins on a word at TPIDRURO base (0x1FF82000).
+    // Seed it with a non-zero pointer to our mapped TLS page.
+    const u32 tls_word = STACK_TLS_VADDR;
+    const std::size_t tls_off = static_cast<std::size_t>(TLS_AREA_VADDR - SYSTEM_INFO_VADDR);
+    if (tls_off + 4 <= system_info_mem_.size()) {
+        system_info_mem_[tls_off + 0] = static_cast<u8>(tls_word);
+        system_info_mem_[tls_off + 1] = static_cast<u8>(tls_word >> 8);
+        system_info_mem_[tls_off + 2] = static_cast<u8>(tls_word >> 16);
+        system_info_mem_[tls_off + 3] = static_cast<u8>(tls_word >> 24);
+    }
+
+    // Seed the first TLS word to a non-zero value. Some startup code uses an atomic
+    // init routine that spins while this is zero.
+    if (tls_mem_.size() >= 4) {
+        const u32 self = STACK_TLS_VADDR;
+        tls_mem_[0] = static_cast<u8>(self);
+        tls_mem_[1] = static_cast<u8>(self >> 8);
+        tls_mem_[2] = static_cast<u8>(self >> 16);
+        tls_mem_[3] = static_cast<u8>(self >> 24);
+    }
 }
 
 void MemorySystem::resetUnmappedLogCount() {
@@ -98,6 +123,12 @@ bool MemorySystem::tryProcessMemory(VAddr addr, std::size_t size, std::size_t& o
         return true;  // VRAM 0x1F000000-0x1F5FFFFF backed in process_memory_ for boot buffers
     }
     return false;
+}
+
+bool MemorySystem::trySharedMemoryTail(VAddr addr, std::size_t size, std::size_t& out_offset) const {
+    if (addr < PROCESS_MEMORY_VADDR_END || addr >= SHARED_MEMORY_VADDR_END) return false;
+    out_offset = addr - PROCESS_MEMORY_VADDR_END;
+    return (out_offset + size) <= shared_memory_tail_.size();
 }
 
 bool MemorySystem::tryVram(VAddr addr, std::size_t size, std::size_t& out_offset) const {
@@ -181,6 +212,7 @@ u8 MemorySystem::read8(VAddr addr) {
     if (tryProcessMemory(addr, 1, offset)) {
         return process_memory_[offset];
     }
+    if (trySharedMemoryTail(addr, 1, offset)) return shared_memory_tail_[offset];
     if (trySystemInfo(addr, 1, offset)) return system_info_mem_[offset];
     if (trySharedPage(addr, 1, offset)) return shared_page_[offset];
     if (tryFcram(addr, 1, offset)) {
@@ -197,9 +229,12 @@ u8 MemorySystem::read8(VAddr addr) {
     if (tryIo(addr)) {
         return 0;
     }
-    if (unmapped_log_count_ < kMaxUnmappedLogPerFrame) {
-        Logger::log("Memory: unmapped read8 addr=0x%08X -> 0\n", addr);
-        ++unmapped_log_count_;
+    if (shouldLogUnmapped()) {
+        if (has_current_access_pc_) {
+            Logger::log("Memory: unmapped read8 pc=0x%08X addr=0x%08X -> 0\n", current_access_pc_, addr);
+        } else {
+            Logger::log("Memory: unmapped read8 addr=0x%08X -> 0\n", addr);
+        }
     }
     return 0;
 }
@@ -210,6 +245,7 @@ u16 MemorySystem::read16(VAddr addr) {
     if (tryTls(addr, 2, offset)) buf = &tls_mem_;
     else if (tryStack(addr, 2, offset)) buf = &stack_mem_;
     else if (tryProcessMemory(addr, 2, offset)) buf = &process_memory_;
+    else if (trySharedMemoryTail(addr, 2, offset)) buf = &shared_memory_tail_;
     else if (trySystemInfo(addr, 2, offset)) buf = &system_info_mem_;
     else if (trySharedPage(addr, 2, offset)) buf = &shared_page_;
     else if (tryFcram(addr, 2, offset)) buf = &fcram_;
@@ -226,9 +262,12 @@ u16 MemorySystem::read16(VAddr addr) {
         return v;
     }
     if (tryIo(addr)) return 0;
-    if (unmapped_log_count_ < kMaxUnmappedLogPerFrame) {
-        Logger::log("Memory: unmapped read16 addr=0x%08X -> 0\n", addr);
-        ++unmapped_log_count_;
+    if (shouldLogUnmapped()) {
+        if (has_current_access_pc_) {
+            Logger::log("Memory: unmapped read16 pc=0x%08X addr=0x%08X -> 0\n", current_access_pc_, addr);
+        } else {
+            Logger::log("Memory: unmapped read16 addr=0x%08X -> 0\n", addr);
+        }
     }
     return 0;
 }
@@ -239,6 +278,7 @@ u32 MemorySystem::read32(VAddr addr) {
     if (tryTls(addr, 4, offset)) buf = &tls_mem_;
     else if (tryStack(addr, 4, offset)) buf = &stack_mem_;
     else if (tryProcessMemory(addr, 4, offset)) buf = &process_memory_;
+    else if (trySharedMemoryTail(addr, 4, offset)) buf = &shared_memory_tail_;
     else if (trySystemInfo(addr, 4, offset)) buf = &system_info_mem_;
     else if (trySharedPage(addr, 4, offset)) buf = &shared_page_;
     else if (tryFcram(addr, 4, offset)) buf = &fcram_;
@@ -259,9 +299,12 @@ u32 MemorySystem::read32(VAddr addr) {
         return v;
     }
     if (tryIo(addr)) return 0;
-    if (unmapped_log_count_ < kMaxUnmappedLogPerFrame) {
-        Logger::log("Memory: unmapped read32 addr=0x%08X -> 0\n", addr);
-        ++unmapped_log_count_;
+    if (shouldLogUnmapped()) {
+        if (has_current_access_pc_) {
+            Logger::log("Memory: unmapped read32 pc=0x%08X addr=0x%08X -> 0\n", current_access_pc_, addr);
+        } else {
+            Logger::log("Memory: unmapped read32 addr=0x%08X -> 0\n", addr);
+        }
     }
     return 0;
 }
@@ -272,6 +315,7 @@ u64 MemorySystem::read64(VAddr addr) {
     if (tryTls(addr, 8, offset)) buf = &tls_mem_;
     else if (tryStack(addr, 8, offset)) buf = &stack_mem_;
     else if (tryProcessMemory(addr, 8, offset)) buf = &process_memory_;
+    else if (trySharedMemoryTail(addr, 8, offset)) buf = &shared_memory_tail_;
     else if (trySystemInfo(addr, 8, offset)) buf = &system_info_mem_;
     else if (trySharedPage(addr, 8, offset)) buf = &shared_page_;
     else if (tryFcram(addr, 8, offset)) buf = &fcram_;
@@ -290,10 +334,12 @@ u64 MemorySystem::read64(VAddr addr) {
 }
 
 void MemorySystem::write8(VAddr addr, u8 value) {
+    if (addr >= STACK_TLS_VADDR && addr < (STACK_TLS_VADDR + 4)) return;
     std::size_t offset = 0;
     if (tryTls(addr, 1, offset)) { tls_mem_[offset] = value; return; }
     if (tryStack(addr, 1, offset)) { stack_mem_[offset] = value; return; }
     if (tryProcessMemory(addr, 1, offset)) { process_memory_[offset] = value; return; }
+    if (trySharedMemoryTail(addr, 1, offset)) { shared_memory_tail_[offset] = value; return; }
     if (trySystemInfo(addr, 1, offset)) { system_info_mem_[offset] = value; return; }
     if (trySharedPage(addr, 1, offset)) { shared_page_[offset] = value; return; }
     if (tryFcram(addr, 1, offset)) { fcram_[offset] = value; return; }
@@ -302,17 +348,23 @@ void MemorySystem::write8(VAddr addr, u8 value) {
         return;
     }
     if (tryIoStub(addr, 1, offset)) { io_stub_[offset] = value; return; }
-    if (unmapped_log_count_ < kMaxUnmappedLogPerFrame) {
-        Logger::log("Memory: unmapped write8 addr=0x%08X value=0x%02X (no-op)\n", addr, value);
-        ++unmapped_log_count_;
+    if (shouldLogUnmapped()) {
+        if (has_current_access_pc_) {
+            Logger::log("Memory: unmapped write8 pc=0x%08X addr=0x%08X value=0x%02X (no-op)\n",
+                        current_access_pc_, addr, value);
+        } else {
+            Logger::log("Memory: unmapped write8 addr=0x%08X value=0x%02X (no-op)\n", addr, value);
+        }
     }
 }
 
 void MemorySystem::write16(VAddr addr, u16 value) {
+    if (addr >= STACK_TLS_VADDR && addr < (STACK_TLS_VADDR + 4)) return;
     std::size_t offset = 0;
     auto* buf = tryTls(addr, 2, offset) ? &tls_mem_
         : tryStack(addr, 2, offset) ? &stack_mem_
         : tryProcessMemory(addr, 2, offset) ? &process_memory_
+        : trySharedMemoryTail(addr, 2, offset) ? &shared_memory_tail_
         : trySystemInfo(addr, 2, offset) ? &system_info_mem_
         : trySharedPage(addr, 2, offset) ? &shared_page_
         : tryFcram(addr, 2, offset) ? &fcram_
@@ -328,17 +380,23 @@ void MemorySystem::write16(VAddr addr, u16 value) {
         io_stub_[offset + 1] = static_cast<u8>(value >> 8);
         return;
     }
-    if (unmapped_log_count_ < kMaxUnmappedLogPerFrame) {
-        Logger::log("Memory: unmapped write16 addr=0x%08X value=0x%04X (no-op)\n", addr, value);
-        ++unmapped_log_count_;
+    if (shouldLogUnmapped()) {
+        if (has_current_access_pc_) {
+            Logger::log("Memory: unmapped write16 pc=0x%08X addr=0x%08X value=0x%04X (no-op)\n",
+                        current_access_pc_, addr, value);
+        } else {
+            Logger::log("Memory: unmapped write16 addr=0x%08X value=0x%04X (no-op)\n", addr, value);
+        }
     }
 }
 
 void MemorySystem::write32(VAddr addr, u32 value) {
+    if (addr >= STACK_TLS_VADDR && addr < (STACK_TLS_VADDR + 4)) return;
     std::size_t offset = 0;
     auto* buf = tryTls(addr, 4, offset) ? &tls_mem_
         : tryStack(addr, 4, offset) ? &stack_mem_
         : tryProcessMemory(addr, 4, offset) ? &process_memory_
+        : trySharedMemoryTail(addr, 4, offset) ? &shared_memory_tail_
         : trySystemInfo(addr, 4, offset) ? &system_info_mem_
         : trySharedPage(addr, 4, offset) ? &shared_page_
         : tryFcram(addr, 4, offset) ? &fcram_
@@ -358,13 +416,36 @@ void MemorySystem::write32(VAddr addr, u32 value) {
         io_stub_[offset + 3] = static_cast<u8>(value >> 24);
         return;
     }
-    if (unmapped_log_count_ < kMaxUnmappedLogPerFrame) {
-        Logger::log("Memory: unmapped write32 addr=0x%08X value=0x%08X (no-op)\n", addr, value);
-        ++unmapped_log_count_;
+    if (shouldLogUnmapped()) {
+        if (has_current_access_pc_) {
+            Logger::log("Memory: unmapped write32 pc=0x%08X addr=0x%08X value=0x%08X (no-op)\n",
+                        current_access_pc_, addr, value);
+        } else {
+            Logger::log("Memory: unmapped write32 addr=0x%08X value=0x%08X (no-op)\n", addr, value);
+        }
     }
 }
 
 void MemorySystem::write64(VAddr addr, u64 value) {
     write32(addr, static_cast<u32>(value));
     write32(addr + 4, static_cast<u32>(value >> 32));
+}
+
+bool MemorySystem::shouldLogUnmapped() {
+    if (unmapped_total_logged_ >= kMaxUnmappedLogTotal || unmapped_log_count_ >= kMaxUnmappedLogPerFrame) {
+        ++unmapped_total_suppressed_;
+        logUnmappedSuppressedOnce();
+        return false;
+    }
+    ++unmapped_log_count_;
+    ++unmapped_total_logged_;
+    return true;
+}
+
+void MemorySystem::logUnmappedSuppressedOnce() {
+    if (unmapped_suppress_notice_printed_) return;
+    if (unmapped_total_logged_ < kMaxUnmappedLogTotal) return;
+    unmapped_suppress_notice_printed_ = true;
+    Logger::log("Memory: unmapped access logging suppressed after %llu entries (further unmapped accesses won't be logged)\n",
+                static_cast<unsigned long long>(unmapped_total_logged_));
 }

@@ -9,10 +9,14 @@
 #include "application.hpp"
 #include "logger.hpp"
 #include <cstdio>
+#include <filesystem>
 #include <string>
 
 int main(int argc, char* argv[])
 {
+    constexpr const char* kDevRomPath = "/home/siekwie/Documents/ROMs/3DS/PokemonSun/decrypted/PokemonSun.3ds";
+    constexpr bool kUseDevRomPath = true;
+
     SDL_SetMainReady();
     Logger::init();
 
@@ -40,23 +44,33 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    Logger::logInfo("Nedob Emulator - ROM Selector\n");
-    Logger::logInfo("Select a ROM file to load...\n");
-
-    // Create file selector
-    // file selector will load rom into emulator
-    // upon loading rom, selector closes
-    // emulator will load rom with correct core
-    FileSelector selector(window);
-    
     RomSelectionResult result;
     bool rom_selected = false;
-    
-    // Show the file dialog
-    selector.showDialog([&result, &rom_selected](const RomSelectionResult& res) {
-        result = res;
+
+    if (kUseDevRomPath && std::filesystem::exists(kDevRomPath)) {
+        result.filepath = kDevRomPath;
+        result.rom_type = RomType::ThreeDS;
+        result.cancelled = false;
+        result.error = false;
         rom_selected = true;
-    });
+        Logger::logInfo("Nedob Emulator - Development ROM mode\n");
+        Logger::logInfo("Using hardcoded ROM: %s\n", kDevRomPath);
+    } else {
+        Logger::logInfo("Nedob Emulator - ROM Selector\n");
+        Logger::logInfo("Select a ROM file to load...\n");
+
+        // Create file selector
+        // file selector will load rom into emulator
+        // upon loading rom, selector closes
+        // emulator will load rom with correct core
+        FileSelector selector(window);
+
+        // Show the file dialog
+        selector.showDialog([&result, &rom_selected](const RomSelectionResult& res) {
+            result = res;
+            rom_selected = true;
+        });
+    }
 
     // Main event loop - wait for file selection or quit
     bool running = true;
