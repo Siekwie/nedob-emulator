@@ -1,5 +1,7 @@
 .cache
 .vscode
 /build
+/build_local
+/build_agent
 /insp
 /vendored/SDL
