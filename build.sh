@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env sh
+set -eu
 
 PROJECT_ROOT="$(pwd)"
 PRIMARY_BUILD_DIR="${PROJECT_ROOT}/build"
@@ -23,7 +23,10 @@ if ! CCACHE_DISABLE=1 cmake "${PROJECT_ROOT}" > cmake_configure.log 2>&1; then
    exit 1
 fi
 
-# Build: log to file (and show on screen)
-CCACHE_DISABLE=1 cmake --build . 2>&1 | tee build_log.txt
+# Build: log to file; only show output on failure (portable across sh).
+if ! CCACHE_DISABLE=1 cmake --build . > build_log.txt 2>&1; then
+   cat build_log.txt
+   exit 1
+fi
 
 echo "Build finished in ${BUILD_DIR}"

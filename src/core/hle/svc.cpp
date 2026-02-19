@@ -2,6 +2,7 @@
 #include "../arm/interpreter.hpp"
 #include "../3ds/memory.hpp"
 #include "../../common/logger.hpp"
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -201,10 +202,14 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
             return true;
         }
         case 0x38: {
-            // GetResourceLimit: return kernel pseudo-handle 0xFFFF8001 (process resource limit). Do not use handle table.
-            constexpr u32 RESOURCE_LIMIT_PSEUDO_HANDLE = 0xFFFF8001u;
+            // GetResourceLimit: return a closeable handle.
+            //
+            // Returning a kernel pseudo-handle here (e.g. 0xFFFF8001) causes userland to later
+            // call CloseHandle on it and hit an error path (svcBreak). Give it a normal handle
+            // so CloseHandle succeeds and the title can proceed.
+            const u32 h = allocHandle("ResourceLimit");
             cpu.state().r[0] = 0;
-            cpu.state().r[1] = RESOURCE_LIMIT_PSEUDO_HANDLE;
+            cpu.state().r[1] = h;
             return true;
         }
         case 0x23: {
@@ -240,29 +245,35 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
             cpu.state().r[0] = 0;
             return true;
         }
-        case 0x3A: {
-            // GetResourceLimitLimitValues/CurrentValues: R0 = handle, R1 = handle (do not use as ptr!). Resource IDs often in R0 or separate buffer.
-            // Use R0 only if it looks like a valid pointer (< 0x80000000); else assume one entry with ID 0 to avoid reading handle as address.
-            const u32 r0 = cpu.state().r[0];
-            const u32 r1_handle = cpu.state().r[1];
-            const u32 out_addr = cpu.state().r[2];
+        case 0x39: // GetResourceLimitLimitValues
+        case 0x3A: { // GetResourceLimitCurrentValues
+            // 3DS ABI (as observed in this title's crt0/libc):
+            //   R0 = resource_id_list (u32*), may be null (treat as one entry with ID 0)
+            //   R1 = resource_limit_handle (pseudo-handle 0xFFFF8001)
+            //   R2 = out_values (u64[count])
+            //   R3 = count
+            //
+            // Important: output is an array of u64 values (8 bytes each), NOT pairs. Writing 16 bytes
+            // per entry will clobber the caller's stack frame (including saved LR), causing bad returns.
+            const bool want_limits = (svc_num == 0x39);
+            const u32 ids_ptr = cpu.state().r[0];
+            const u32 out_ptr = cpu.state().r[2];
             u32 count = cpu.state().r[3];
-            if (count > 16u) count = 16u;
-            const bool r0_looks_like_ptr = (r0 != 0 && r0 < 0x80000000u);
-            const u32 ids_ptr = r0_looks_like_ptr ? r0 : 0;
+            if (count > 32u) count = 32u;
+
             constexpr u64 COMMIT_LIMIT = 0x08000000ULL;
-            constexpr u64 COMMIT_CURRENT = 0x02000000ULL;
+            constexpr u64 COMMIT_CURRENT = 0x00000000ULL;
             constexpr u64 PRIORITY_LIMIT = 64ULL;
             constexpr u64 PRIORITY_CURRENT = 1ULL;
-            (void)r1_handle;
+            (void)cpu.state().r[1]; // handle (pseudo)
+
             for (u32 i = 0; i < count; ++i) {
-                u8 rid = 0;
-                if (ids_ptr != 0) rid = static_cast<u8>(cpu.memory_.read8(ids_ptr + i));
-                u64 limit = 0, current = 0;
-                if (rid == 0) { limit = COMMIT_LIMIT;   current = COMMIT_CURRENT; }
-                else if (rid == 1) { limit = PRIORITY_LIMIT; current = PRIORITY_CURRENT; }
-                cpu.memory_.write64(out_addr + i * 16, limit);
-                cpu.memory_.write64(out_addr + i * 16 + 8, current);
+                u32 rid = 0;
+                if (ids_ptr != 0) rid = cpu.memory_.read32(ids_ptr + i * 4u);
+                u64 value = 0;
+                if (rid == 0) value = want_limits ? COMMIT_LIMIT : COMMIT_CURRENT;
+                else if (rid == 1) value = want_limits ? PRIORITY_LIMIT : PRIORITY_CURRENT;
+                cpu.memory_.write64(out_ptr + i * 8u, value);
             }
             cpu.state().r[0] = 0;
             return true;
@@ -331,7 +342,14 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
             const auto& r = cpu.state().r;
             Logger::log("Kernel Break hit!  R0=0x%08X R1=0x%08X R2=0x%08X R3=0x%08X R4=0x%08X R5=0x%08X R6=0x%08X R7=0x%08X R8=0x%08X R9=0x%08X R10=0x%08X R11=0x%08X R12=0x%08X SP=0x%08X LR=0x%08X PC=0x%08X\n",
                         r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], cpu.getPC());
-            return true;
+            // On real hardware this is typically a non-returning debug/panic trap.
+            // However, many retail titles will only reach it if our HLE stubs return
+            // unexpected values (triggering asserts). Default to ignoring the break
+            // so we can discover the next missing feature, but allow opting into a
+            // hard stop for debugging.
+            const char* stop = std::getenv("NEDOB_STOP_ON_BREAK");
+            cpu.state().r[0] = 0;  // success
+            return (stop && stop[0] == '1') ? false : true;
         }
         case 0x3D:
             Logger::log("SVC OutputDebugString (addr=0x%08X, len=%u)\n",

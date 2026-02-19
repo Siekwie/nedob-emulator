@@ -2,6 +2,7 @@
 #include "../3ds/memory.hpp"
 #include "../../common/logger.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 
@@ -9,12 +10,33 @@ namespace {
 
 // Off by default; set to true only when debugging (e.g. after SVC to trace next instructions).
 static bool s_log_reg_writes = false;
-static bool s_trace_enabled = true;
+static bool s_trace_enabled = false;
 static int s_trace_remaining = -1;
 static bool s_trace_done = false;
 
+u32 parseU32Env(const char* name, u32 default_value) {
+    const char* s = std::getenv(name);
+    if (!s || !*s) return default_value;
+    char* end = nullptr;
+    unsigned long v = std::strtoul(s, &end, 0);  // base 0: accepts 0x... hex
+    if (!end || *end != '\0') return default_value;
+    return static_cast<u32>(v);
+}
+
+int parseIntEnv(const char* name, int default_value) {
+    const char* s = std::getenv(name);
+    if (!s || !*s) return default_value;
+    char* end = nullptr;
+    long v = std::strtol(s, &end, 0);
+    if (!end || *end != '\0') return default_value;
+    if (v < 1) return default_value;
+    if (v > 2000) v = 2000;  // keep logs bounded
+    return static_cast<int>(v);
+}
+
 void logRegWrite(u32 reg, u32 value, u32 pc) {
-    if (s_log_reg_writes && reg <= 14)
+    // Register writes are frequent; only log during an active trace window.
+    if (s_log_reg_writes && s_trace_remaining >= 0 && reg <= 14)
         Logger::log("  REG W R%u = 0x%08X  (PC=0x%08X)\n", reg, value, pc);
 }
 
@@ -90,10 +112,13 @@ inline int32_t signExtend24(u32 v) {
     return static_cast<int32_t>((v & 0x800000) ? (v | 0xFF000000) : v);
 }
 
-// Trace: log next N instructions when PC hits either trigger (loop at 0x00100004 / 0x001045B4).
-constexpr u32 TRACE_TRIGGER_PC = 0x001069CCu;
-constexpr u32 TRACE_TRIGGER_PC_LOOP = 0x001069D0u;
-constexpr int TRACE_INSTRUCTION_COUNT = 48;
+// Trace: log next N instructions when PC hits either trigger.
+constexpr u32 TRACE_TRIGGER_PC_DEFAULT = 0x00108A48u;
+constexpr u32 TRACE_TRIGGER_PC_LOOP_DEFAULT = 0x00108A48u;
+constexpr int TRACE_INSTRUCTION_COUNT_DEFAULT = 200;
+static u32 s_trace_trigger_pc = TRACE_TRIGGER_PC_DEFAULT;
+static u32 s_trace_trigger_pc_loop = TRACE_TRIGGER_PC_LOOP_DEFAULT;
+static int s_trace_instruction_count = TRACE_INSTRUCTION_COUNT_DEFAULT;
 
 void logArmDisasm(u32 pc, u32 inst, int index, bool is_trigger_pc,
                   const u32* r, u32 cpsr) {
@@ -102,7 +127,7 @@ void logArmDisasm(u32 pc, u32 inst, int index, bool is_trigger_pc,
     const u32 c = cond(inst);
     const u32 n = (cpsr >> 31) & 1u, z = (cpsr >> 30) & 1u, c_flag = (cpsr >> 29) & 1u, v = (cpsr >> 28) & 1u;
 
-    if ((inst & 0xF0000000u) == 0xF0000000u && (inst & 0x0F000000u) == 0x0F000000u) {
+    if ((inst & MASK_SVC) == VAL_SVC) {
         std::snprintf(mnem, sizeof(mnem), "SVC #0x%06X", inst & 0xFFFFFFu);
     } else if (bits27_25 == 5) {
         const int32_t off = signExtend24(inst & 0xFFFFFFu) * 4;
@@ -117,9 +142,10 @@ void logArmDisasm(u32 pc, u32 inst, int index, bool is_trigger_pc,
         const char* size = (inst & (1u << 22)) ? "B" : "";
         std::snprintf(mnem, sizeof(mnem), "%s%s R%u, [R%u, #%u]",
                       load, size, rd, rn, off12);
-    } else if ((inst & 0x0FFFFFF0u) == 0x012FFF10u) {
+    } else if (((inst & 0x0FFFFFF0u) == 0x012FFF10u) || ((inst & 0x0FFFFFF0u) == 0x012FFF30u)) {
         const u32 rm = inst & 0xFu;
-        std::snprintf(mnem, sizeof(mnem), "%s R%u", (inst & (1u << 5)) ? "BLX" : "BX", rm);
+        const char* op = ((inst & 0x0FFFFFF0u) == 0x012FFF30u) ? "BLX" : "BX";
+        std::snprintf(mnem, sizeof(mnem), "%s R%u", op, rm);
     } else if (bits27_25 == 4) {
         const u32 rn = (inst >> 16) & 0xFu;
         const u32 list = inst & 0xFFFFu;
@@ -183,8 +209,10 @@ u32 expandImm12(u32 imm12_val) {
     u32 rot = (imm12_val >> 8) & 0xF;
     u32 imm8 = imm12_val & 0xFF;
     if (rot == 0) return imm8;
-    u32 val = imm8 | (imm8 << 16);
-    return (val >> (rot * 2)) | (val << (32 - rot * 2));
+    const u32 shift = rot * 2;
+    // ARM "modified immediate": 8-bit value rotated right by an even number of bits.
+    // (rot==0 means no rotation)
+    return (imm8 >> shift) | (imm8 << (32 - shift));
 }
 
 // Second operand for data-processing only. Do not use for LDR/STR offset.
@@ -192,7 +220,9 @@ u32 getOp2DataProcessing(ArmInterpreter& cpu, u32 inst) {
     if (I(inst)) {
         return expandImm12(imm12(inst));
     }
-    u32 rm_val = cpu.state().r[Rm(inst)];
+    const u32 rm = Rm(inst);
+    // In ARM state, reads of R15 as an operand yield (PC + 8) due to the pipeline.
+    u32 rm_val = (rm == 15) ? (cpu.state().r[15] + 8u) : cpu.state().r[rm];
     constexpr u32 SHIFT_TYPE_MASK = 3u;
     constexpr u32 SHIFT_IMM_MASK = 0x1Fu;
     u32 shift_type = (inst >> 5) & SHIFT_TYPE_MASK;
@@ -238,6 +268,14 @@ inline bool overflowFromAdd(u32 src1, u32 src2, u32 result) {
 
 ArmInterpreter::ArmInterpreter(MemorySystem& memory, SvcHandler svc_handler)
     : memory_(memory), svc_handler_(std::move(svc_handler)), state_{} {
+    // Debug toggles; keep off by default to avoid multi-GB logs.
+    if (const char* v = std::getenv("NEDOB_TRACE"); v && v[0] == '1') s_trace_enabled = true;
+    if (const char* v = std::getenv("NEDOB_LOG_REG_WRITES"); v && v[0] == '1') s_log_reg_writes = true;
+    if (s_trace_enabled) {
+        s_trace_trigger_pc = parseU32Env("NEDOB_TRACE_TRIGGER_PC", TRACE_TRIGGER_PC_DEFAULT);
+        s_trace_trigger_pc_loop = parseU32Env("NEDOB_TRACE_TRIGGER_PC_LOOP", TRACE_TRIGGER_PC_LOOP_DEFAULT);
+        s_trace_instruction_count = parseIntEnv("NEDOB_TRACE_COUNT", TRACE_INSTRUCTION_COUNT_DEFAULT);
+    }
     for (u32 i = 0; i < 16; ++i) {
         state_.r[i] = 0;
     }
@@ -283,6 +321,15 @@ bool ArmInterpreter::execute() {
                     pc, state_.r[14], state_.r[13]);
         return false;
     }
+
+    // Bringup helper: detect first entry into the known idle loop at 0x0010486C/0x00104870.
+    static u32 s_prev_pc = 0;
+    if ((pc == 0x0010486Cu || pc == 0x00104870u) &&
+        !(s_prev_pc == 0x0010486Cu || s_prev_pc == 0x00104870u)) {
+        Logger::log("Entered idle loop at PC=0x%08X from PC=0x%08X (LR=0x%08X SP=0x%08X)\n",
+                    pc, s_prev_pc, state_.r[14], state_.r[13]);
+    }
+    s_prev_pc = pc;
 
     // Thumb state: minimal Thumb-16 support (enough to get through common veneers/trampolines).
     // The 3DS userland binaries do use interworking, so we must honor CPSR.T on BX/BLX.
@@ -727,14 +774,14 @@ thumb_unknown:
     const u32 cond_bits = cond(inst);
 
     if (s_trace_enabled && !s_trace_done &&
-        (pc == TRACE_TRIGGER_PC || pc == TRACE_TRIGGER_PC_LOOP) && s_trace_remaining < 0) {
-        s_trace_remaining = TRACE_INSTRUCTION_COUNT;
+        (pc == s_trace_trigger_pc || pc == s_trace_trigger_pc_loop) && s_trace_remaining < 0) {
+        s_trace_remaining = s_trace_instruction_count;
         s_trace_done = true;
-        Logger::log("=== Trace: next %d instructions. State shown is BEFORE each instruction runs. ===\n", TRACE_INSTRUCTION_COUNT);
+        Logger::log("=== Trace: next %d instructions. State shown is BEFORE each instruction runs. ===\n", s_trace_instruction_count);
     }
     if (s_trace_enabled && s_trace_remaining >= 0) {
-        const int index = TRACE_INSTRUCTION_COUNT - s_trace_remaining;
-        logArmDisasm(pc, inst, index, pc == TRACE_TRIGGER_PC, state_.r, state_.cpsr);
+        const int index = s_trace_instruction_count - s_trace_remaining;
+        logArmDisasm(pc, inst, index, pc == s_trace_trigger_pc, state_.r, state_.cpsr);
         --s_trace_remaining;
     }
 
@@ -747,9 +794,16 @@ thumb_unknown:
         const u32 saved_lr = state_.r[14];
         if (svc_handler_) {
             const bool cont = svc_handler_(svc_num);
+            if (!cont) {
+                // Make "stop" persistent: keep PC on the SVC so the next slice
+                // immediately returns 0 cycles and the core can mark execution stopped.
+                state_.r[15] = pc;
+                state_.r[14] = saved_lr;
+                return false;
+            }
             state_.r[15] = saved_pc;
             state_.r[14] = saved_lr;
-            return cont;
+            return true;
         }
         return true;
     }
@@ -794,7 +848,7 @@ thumb_unknown:
     // LDM/STM (bits 27-25 = 100). In ARMv7, cond=15 (0xF) is often "unconditional" for this class; do not skip.
     const bool is_ldm_stm = (bits27_25 == 4);
     if (!is_ldm_stm && !conditionPassed(cond_bits, state_.cpsr)) {
-        if (s_trace_enabled && bits27_25 == 5) {
+        if (s_trace_enabled && s_trace_remaining >= 0 && bits27_25 == 5) {
             const u32 n = (state_.cpsr >> 31) & 1u, z = (state_.cpsr >> 30) & 1u, c = (state_.cpsr >> 29) & 1u, v = (state_.cpsr >> 28) & 1u;
             Logger::log("  B cond=0x%X NOT TAKEN -> next inst  NZCV=%u%u%u%u\n", cond_bits, n, z, c, v);
         }
@@ -813,6 +867,15 @@ thumb_unknown:
         const u32 n = (state_.cpsr >> 31) & 1u, z = (state_.cpsr >> 30) & 1u, c = (state_.cpsr >> 29) & 1u, v = (state_.cpsr >> 28) & 1u;
         const int32_t offset_bytes = signExtend24(imm24(inst)) * 4;
         const u32 target = state_.r[15] + 8 + offset_bytes;
+        // Bringup helper: detect when userland falls into the "idle/panic" infinite loop.
+        static bool s_idle_loop_reported = false;
+        if (!s_idle_loop_reported && taken &&
+            (target == 0x0010486Cu || target == 0x00104870u) &&
+            (pc != 0x0010486Cu && pc != 0x00104870u)) {
+            Logger::log("Entered idle loop: branch from PC=0x%08X to 0x%08X (LR=0x%08X)\n",
+                        pc, target, state_.r[14]);
+            s_idle_loop_reported = true;
+        }
         if (s_trace_enabled && s_trace_remaining >= 0 && cond_b != COND_AL && cond_b != COND_NV)
             Logger::log("  B cond=0x%X %s -> 0x%08X  NZCV=%u%u%u%u\n", cond_b, taken ? "TAKEN" : "not taken", target, n, z, c, v);
         const bool is_bl = (inst & (1u << 24)) != 0;
@@ -834,12 +897,23 @@ thumb_unknown:
             if (B(inst)) {
                 u32 val = memory_.read8(addr);
                 writeReg(rd, val);
-                if (s_trace_enabled && rn == 15)
+                if (s_trace_enabled && s_trace_remaining >= 0 && rn == 15)
                     Logger::log("  LDRB [PC,#%s%u] addr=0x%08X -> 0x%02X\n", U(inst) ? "" : "-", offset12, addr, val & 0xFFu);
             } else {
                 u32 val = memory_.read32(addr);
-                writeReg(rd, val);
-                if (s_trace_enabled && rn == 15)
+                // Loads into PC can switch instruction set state (ARMv5+ behavior).
+                // This matters for veneers and for `pop {..., pc}` sequences.
+                if (rd == 15) {
+                    if (s_trace_enabled && s_trace_remaining >= 0) {
+                        Logger::log("LDR POP PC: loading value 0x%08X from addr 0x%08X into PC\n", val, addr);
+                    }
+                    if ((val & 1u) != 0) state_.cpsr |= CPSR_T;
+                    else state_.cpsr &= ~CPSR_T;
+                    state_.r[15] = val & ~1u;
+                } else {
+                    writeReg(rd, val);
+                }
+                if (s_trace_enabled && s_trace_remaining >= 0 && rn == 15)
                     Logger::log("  LDR [PC,#%s%u] addr=0x%08X -> 0x%08X\n", U(inst) ? "" : "-", offset12, addr, val);
             }
         } else {
@@ -854,7 +928,85 @@ thumb_unknown:
         bool do_writeback = (!P(inst) || W(inst)) && (rn != 15);
         if (do_writeback)
             writeReg(rn, P(inst) ? addr : (base + offset_val));
-        advancePC();
+        // If we loaded PC, we already branched (and possibly switched state).
+        if (!(L(inst) && rd == 15)) {
+            advancePC();
+        }
+        return true;
+    }
+
+    // LDR/STR register offset (bits 27-25 = 011). Commonly used by memcpy/memset loops.
+    if (bits27_25 == 3) {
+        const u32 rn = Rn(inst);
+        const u32 rd = Rd(inst);
+        const u32 rm = Rm(inst);
+        const u32 base = (rn == 15) ? (state_.r[15] + 8) : state_.r[rn];
+
+        const u32 shift_imm = (inst >> 7) & 0x1Fu;
+        const u32 shift_type = (inst >> 5) & 0x3u; // 00 LSL, 01 LSR, 10 ASR, 11 ROR/RRX
+        u32 off = state_.r[rm];
+        switch (shift_type) {
+            case 0: // LSL
+                off = (shift_imm == 0) ? off : (off << shift_imm);
+                break;
+            case 1: { // LSR (imm==0 => 32)
+                const u32 s = (shift_imm == 0) ? 32u : shift_imm;
+                off = (s == 32u) ? 0u : (off >> s);
+                break;
+            }
+            case 2: { // ASR (imm==0 => 32)
+                const u32 s = (shift_imm == 0) ? 32u : shift_imm;
+                off = static_cast<u32>(static_cast<s32>(off) >> (s == 32u ? 31u : s));
+                break;
+            }
+            case 3: // ROR (imm==0 => RRX)
+                if (shift_imm == 0) {
+                    const u32 c = ((state_.cpsr & CpsrFlags::C) != 0) ? 1u : 0u;
+                    off = (c << 31) | (off >> 1);
+                } else {
+                    const u32 r = shift_imm & 31u;
+                    off = (off >> r) | (off << ((32u - r) & 31u));
+                }
+                break;
+        }
+
+        const u32 offset_val = U(inst) ? off : (0u - off);
+        const u32 addr = P(inst) ? (base + offset_val) : base;
+
+        if (L(inst)) {
+            if (B(inst)) {
+                const u32 val = memory_.read8(addr);
+                writeReg(rd, val);
+            } else {
+                const u32 val = memory_.read32(addr);
+                if (rd == 15) {
+                    if (s_trace_enabled && s_trace_remaining >= 0) {
+                        Logger::log("LDR POP PC: loading value 0x%08X from addr 0x%08X into PC\n", val, addr);
+                    }
+                    if ((val & 1u) != 0) state_.cpsr |= CPSR_T;
+                    else state_.cpsr &= ~CPSR_T;
+                    state_.r[15] = val & ~1u;
+                } else {
+                    writeReg(rd, val);
+                }
+            }
+        } else {
+            if (B(inst)) {
+                logStackRegionWrite(addr, state_.r[rd] & 0xFFu, state_.r[13], state_.r[15]);
+                memory_.write8(addr, static_cast<u8>(state_.r[rd]));
+            } else {
+                logStackRegionWrite(addr, state_.r[rd], state_.r[13], state_.r[15]);
+                memory_.write32(addr, state_.r[rd]);
+            }
+        }
+
+        const bool do_writeback = (!P(inst) || W(inst)) && (rn != 15);
+        if (do_writeback) {
+            writeReg(rn, P(inst) ? addr : (base + offset_val));
+        }
+        if (!(L(inst) && rd == 15)) {
+            advancePC();
+        }
         return true;
     }
 
@@ -931,8 +1083,13 @@ thumb_unknown:
                     if (s_trace_enabled && s_trace_remaining >= 0) {
                         Logger::log("LDM POP PC: loading value 0x%08X from addr 0x%08X into PC\n", value, addr);
                     }
+                    // Loading PC via LDM can switch instruction set state (bit0 indicates Thumb).
+                    if ((value & 1u) != 0) state_.cpsr |= CPSR_T;
+                    else state_.cpsr &= ~CPSR_T;
+                    state_.r[15] = value & ~1u;
+                } else {
+                    writeReg(i, value);
                 }
-                writeReg(i, value);
                 addr += 4;
             }
         } else {
@@ -982,10 +1139,11 @@ thumb_unknown:
     if (bits27_25 == 0 || bits27_25 == 1) {
         const u32 op1 = opcode1(inst);
 
-        // BX / BLX (register): 0x012FFF10 = BX Rm, 0x012FFF30 = BLX Rm (L=1). Target must be word-aligned (bit 0 clear).
-        if ((inst & MASK_BLX_REG) == 0x012FFF10) {
-            const bool is_blx = (inst & (1u << 5)) != 0;
-            const u32 rm = Rm(inst);
+        // BX / BLX (register): 0x012FFF10 = BX Rm, 0x012FFF30 = BLX Rm (L=1).
+        const u32 bx_tag = (inst & 0x0FFFFFF0u);
+        if (bx_tag == 0x012FFF10u || bx_tag == 0x012FFF30u) {
+            const bool is_blx = (bx_tag == 0x012FFF30u);
+            const u32 rm = inst & 0xFu;
             const u32 target = state_.r[rm];
             if (!is_blx && rm == 14) {
                 // This can be extremely spammy in busy loops; only log during an active trace window.
@@ -1010,7 +1168,8 @@ thumb_unknown:
         // SUB (and SUB with S): Rd = Rn - Op2; when S, C = no borrow = (Rn >= Op2). Do not write Rd for CMP (Rd==15).
         if ((inst & MASK_COND_OP1_S_Rd) == 0x00500000 && Rd(inst) != 15) {
             u32 rd = Rd(inst);
-            u32 rn_val = state_.r[Rn(inst)];
+            const u32 rn = Rn(inst);
+            u32 rn_val = (rn == 15) ? (pc + 8u) : state_.r[rn];
             u32 op2_val = getOp2DataProcessing(*this, inst);
             u32 result = rn_val - op2_val;
             writeReg(rd, result);
@@ -1027,7 +1186,8 @@ thumb_unknown:
 
         // CMP: SUBS with Rd=15. Only set flags; NEVER write to any register (not R0, not R15).
         if ((inst & MASK_COND_OP1_S_Rd) == 0x00A000F0) {
-            u32 rn_val = state_.r[Rn(inst)];
+            const u32 rn = Rn(inst);
+            u32 rn_val = (rn == 15) ? (pc + 8u) : state_.r[rn];
             u32 op2_val = getOp2DataProcessing(*this, inst);
             u32 result = rn_val - op2_val;
             bool n_flag = (result & 0x80000000u) != 0;
@@ -1049,7 +1209,7 @@ thumb_unknown:
             u32 addr = P(inst) ? (base + offset_val) : base;
             u32 val = memory_.read32(addr);
             writeReg(rd, val);
-            if (s_trace_enabled && rn == 15)
+            if (s_trace_enabled && s_trace_remaining >= 0 && rn == 15)
                 Logger::log("  LDR [PC,#%s%u] addr=0x%08X -> 0x%08X (opcode 0x05800000 path)\n", U(inst) ? "" : "-", offset12, addr, val);
             if ((!P(inst) || W(inst)) && rn != 15) writeReg(rn, P(inst) ? addr : (base + offset_val));
             advancePC();
@@ -1074,7 +1234,8 @@ thumb_unknown:
         // Data-processing (register form): Op2 from register + shift. S-bit means update flags (including CMP/TST/TEQ/CMN where Rd=15).
         if ((inst & MASK_DATAPROC) == 0x00000000 && !I(inst)) {
             u32 rd = Rd(inst);
-            u32 rn_val = state_.r[Rn(inst)];
+            const u32 rn = Rn(inst);
+            u32 rn_val = (rn == 15) ? (pc + 8u) : state_.r[rn];
             u32 op2_val = getOp2DataProcessing(*this, inst);
             u32 result = 0;
             switch (op1) {
@@ -1137,7 +1298,8 @@ thumb_unknown:
         // Data-processing (immediate form): Op2 = expanded imm12. S-bit means update flags (including CMP/CMN with Rd=15).
         if ((inst & MASK_DATAPROC_IMM) == 0x02000000 && I(inst)) {
             u32 rd = Rd(inst);
-            u32 rn_val = state_.r[Rn(inst)];
+            const u32 rn = Rn(inst);
+            u32 rn_val = (rn == 15) ? (pc + 8u) : state_.r[rn];
             u32 op2_val = expandImm12(imm12(inst));
             u32 result = 0;
             switch (op1) {

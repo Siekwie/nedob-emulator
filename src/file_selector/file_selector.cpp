@@ -1,5 +1,7 @@
 #include "file_selector.hpp"
 #include <SDL3/SDL_dialog.h>
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_timer.h>
 #include <cstring>
 #include <algorithm>
 

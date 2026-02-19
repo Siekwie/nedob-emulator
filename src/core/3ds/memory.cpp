@@ -1,5 +1,7 @@
 #include "memory.hpp"
 #include "../../common/logger.hpp"
+#include <cstdlib>
+#include <cctype>
 #include <cstring>
 
 namespace {
@@ -19,6 +21,15 @@ MemorySystem::MemorySystem() {
     stack_mem_.resize(STACK_REGION_SIZE, 0);
     tls_mem_.resize(STACK_TLS_SIZE, 0);
     io_stub_.resize(IO_STUB_SIZE, 0);
+    // Allow code to "call" into the IO stub region (used for bringup hacks / callbacks).
+    // Place a tiny ARM stub at 0x04000000: `BX LR`.
+    if (io_stub_.size() >= 4) {
+        const u32 bx_lr = 0xE12FFF1Eu;
+        io_stub_[0] = static_cast<u8>(bx_lr);
+        io_stub_[1] = static_cast<u8>(bx_lr >> 8);
+        io_stub_[2] = static_cast<u8>(bx_lr >> 16);
+        io_stub_[3] = static_cast<u8>(bx_lr >> 24);
+    }
     const u64 tick = 0x1000000ULL;
     shared_page_[0x08] = static_cast<u8>(tick);
     shared_page_[0x09] = static_cast<u8>(tick >> 8);
@@ -49,6 +60,22 @@ MemorySystem::MemorySystem() {
         tls_mem_[1] = static_cast<u8>(self >> 8);
         tls_mem_[2] = static_cast<u8>(self >> 16);
         tls_mem_[3] = static_cast<u8>(self >> 24);
+    }
+
+    if (const char* v = std::getenv("NEDOB_BREAK_SPINS"); v && v[0] == '1') {
+        break_spins_enabled_ = true;
+    }
+    if (const char* v = std::getenv("NEDOB_SPIN_THRESHOLD"); v && v[0] != '\0') {
+        const unsigned long t = std::strtoul(v, nullptr, 0);
+        if (t > 0 && t <= 1000000000ul) {
+            spin_threshold_ = static_cast<u32>(t);
+        }
+    }
+    if (const char* v = std::getenv("NEDOB_PATCH_PANIC_LOOP"); v && v[0] == '1') {
+        patch_panic_loop_ = true;
+    }
+    if (const char* v = std::getenv("NEDOB_LOG_PANIC_STRING"); v && v[0] == '1') {
+        log_panic_string_ = true;
     }
 }
 
@@ -101,15 +128,19 @@ void MemorySystem::mapCode(VAddr vaddr, const u8* data, std::size_t size) {
 }
 
 bool MemorySystem::tryFcram(VAddr addr, std::size_t size, std::size_t& out_offset) const {
-    (void)addr;
-    (void)size;
-    (void)out_offset;
-    return false;
+    // Some userland code (or stubs) may deal with physical FCRAM addresses directly.
+    // Map 0x20000000..0x27FFFFFF to our backing FCRAM buffer.
+    if (addr < FCRAM_PADDR || addr >= FCRAM_PADDR_END) return false;
+    out_offset = static_cast<std::size_t>(addr - FCRAM_PADDR);
+    return (out_offset + size) <= fcram_.size();
 }
 
 bool MemorySystem::tryProcessMemory(VAddr addr, std::size_t size, std::size_t& out_offset) const {
     if (addr >= STACK_TLS_VADDR && addr < STACK_TLS_VADDR_END) return false;
     if (addr >= STACK_REGION_VADDR && addr < STACK_REGION_VADDR_END) return false;
+    // This low address range is used by a bunch of legacy/HW-facing code paths.
+    // Route it to our IO stub backing store instead of treating it as process RAM.
+    if (addr >= IO_STUB_VADDR && addr < IO_STUB_VADDR_END) return false;
     if (addr < PROCESS_MEMORY_VADDR_END) {
         out_offset = addr;
         if (addr >= process_memory_.size()) return false;
@@ -284,10 +315,108 @@ u32 MemorySystem::read32(VAddr addr) {
     else if (tryFcram(addr, 4, offset)) buf = &fcram_;
     else if (tryVram(addr, 4, offset)) buf = (addr >= VRAM_VADDR && addr < VRAM_VADDR_END) ? &vram_ : &fcram_;
     if (buf) {
-        return static_cast<u32>((*buf)[offset]) |
-               (static_cast<u32>((*buf)[offset + 1]) << 8) |
-               (static_cast<u32>((*buf)[offset + 2]) << 16) |
-               (static_cast<u32>((*buf)[offset + 3]) << 24);
+        u32 v = static_cast<u32>((*buf)[offset]) |
+                (static_cast<u32>((*buf)[offset + 1]) << 8) |
+                (static_cast<u32>((*buf)[offset + 2]) << 16) |
+                (static_cast<u32>((*buf)[offset + 3]) << 24);
+
+        // Debug escape hatch for single-threaded bringup: if user code is spinning on a
+        // process-memory word becoming non-zero, force it non-zero after enough identical reads.
+        if (break_spins_enabled_ && has_current_access_pc_ && buf == &process_memory_ && v == 0) {
+            if (spin_last_addr_ == addr && spin_last_pc_ == current_access_pc_) {
+                ++spin_same_read_count_;
+            } else {
+                spin_last_addr_ = addr;
+                spin_last_pc_ = current_access_pc_;
+                spin_same_read_count_ = 1;
+            }
+
+            if (spin_same_read_count_ == spin_threshold_) {
+                // Write a pointer to our IO-stub trampoline (0x04000000) directly to backing store.
+                // This tends to satisfy "wait until callback ptr is non-null; then BLX it" codepaths.
+                const u32 forced = IO_STUB_VADDR;
+                (*buf)[offset + 0] = static_cast<u8>(forced);
+                (*buf)[offset + 1] = static_cast<u8>(forced >> 8);
+                (*buf)[offset + 2] = static_cast<u8>(forced >> 16);
+                (*buf)[offset + 3] = static_cast<u8>(forced >> 24);
+                v = forced;
+
+                // If we hit the known panic/poll loop in Pokemon Sun bringup, try to extract the
+                // message string and optionally patch the infinite loop into a return so we can
+                // discover the next missing feature.
+                if (current_access_pc_ == 0x001074C0u && addr == 0x0063DCCCu) {
+                    if (log_panic_string_ && !panic_string_printed_) {
+                        std::size_t msg_off = 0;
+                        constexpr VAddr kMsgAddr = 0x001074E0u;
+                        if (tryProcessMemory(kMsgAddr, 1, msg_off)) {
+                            char msg[129];
+                            std::size_t out_i = 0;
+                            for (; out_i + 1 < sizeof(msg); ++out_i) {
+                                const u8 ch = process_memory_[msg_off + out_i];
+                                if (ch == 0) break;
+                                msg[out_i] = (std::isprint(ch) || ch == '\n' || ch == '\t') ? static_cast<char>(ch) : '.';
+                            }
+                            msg[out_i] = '\0';
+                            Logger::log("Panic loop message @0x%08X: \"%s\"\n", kMsgAddr, msg);
+                            panic_string_printed_ = true;
+                        }
+                    }
+                    if (patch_panic_loop_) {
+                        // The loop body uses `BLX R2`, which overwrites LR with 0x001074D8.
+                        // If we only patch the tail to `BX LR`, it will just jump to itself.
+                        // Patch both sites:
+                        // - replace `BLX R2` with `BX R2` (preserve caller LR)
+                        // - replace the loop-back branch with `BX LR` (return to caller)
+                        constexpr VAddr kPatchBlxAddr = 0x001074D4u;
+                        constexpr VAddr kPatchTailAddr = 0x001074D8u;
+                        std::size_t blx_off = 0, tail_off = 0;
+                        const bool ok_blx = tryProcessMemory(kPatchBlxAddr, 4, blx_off);
+                        const bool ok_tail = tryProcessMemory(kPatchTailAddr, 4, tail_off);
+                        if (ok_blx && ok_tail) {
+                            const u32 bx_r2 = 0xE12FFF12u;
+                            const u32 bx_lr = 0xE12FFF1Eu;
+                            process_memory_[blx_off + 0] = static_cast<u8>(bx_r2);
+                            process_memory_[blx_off + 1] = static_cast<u8>(bx_r2 >> 8);
+                            process_memory_[blx_off + 2] = static_cast<u8>(bx_r2 >> 16);
+                            process_memory_[blx_off + 3] = static_cast<u8>(bx_r2 >> 24);
+                            process_memory_[tail_off + 0] = static_cast<u8>(bx_lr);
+                            process_memory_[tail_off + 1] = static_cast<u8>(bx_lr >> 8);
+                            process_memory_[tail_off + 2] = static_cast<u8>(bx_lr >> 16);
+                            process_memory_[tail_off + 3] = static_cast<u8>(bx_lr >> 24);
+                            Logger::log("Panic loop patch: BX R2 @0x%08X, BX LR @0x%08X\n",
+                                        kPatchBlxAddr, kPatchTailAddr);
+                        }
+
+                        // The caller at 0x00104868 uses `BL 0x001074BC`, which clobbers LR before
+                        // entering the panic routine. If we want to "return" from the panic path,
+                        // turn that BL into a plain B so LR stays as the caller's LR.
+                        constexpr VAddr kPatchCallerBl = 0x00104868u;
+                        std::size_t caller_off = 0;
+                        if (tryProcessMemory(kPatchCallerBl, 4, caller_off)) {
+                            const u32 w = static_cast<u32>(process_memory_[caller_off]) |
+                                          (static_cast<u32>(process_memory_[caller_off + 1]) << 8) |
+                                          (static_cast<u32>(process_memory_[caller_off + 2]) << 16) |
+                                          (static_cast<u32>(process_memory_[caller_off + 3]) << 24);
+                            if (w == 0xEB000B13u) {  // BL 0x001074BC
+                                const u32 patched = (w & ~(1u << 24));  // B to same target
+                                process_memory_[caller_off + 0] = static_cast<u8>(patched);
+                                process_memory_[caller_off + 1] = static_cast<u8>(patched >> 8);
+                                process_memory_[caller_off + 2] = static_cast<u8>(patched >> 16);
+                                process_memory_[caller_off + 3] = static_cast<u8>(patched >> 24);
+                                Logger::log("Panic loop patch: changed BL->B at 0x%08X\n", kPatchCallerBl);
+                            }
+                        }
+                    }
+                }
+                if (!spin_notice_printed_) {
+                    Logger::log("Memory: broke spin-wait at pc=0x%08X addr=0x%08X (forced 0x%08X)\n",
+                                current_access_pc_, addr, forced);
+                    spin_notice_printed_ = true;
+                }
+            }
+        }
+
+        return v;
     }
     if (tryIoStub(addr, 4, offset)) {
         u32 v = static_cast<u32>(io_stub_[offset]) |
@@ -347,7 +476,12 @@ void MemorySystem::write8(VAddr addr, u8 value) {
         (addr >= VRAM_VADDR && addr < VRAM_VADDR_END ? vram_ : fcram_)[offset] = value;
         return;
     }
-    if (tryIoStub(addr, 1, offset)) { io_stub_[offset] = value; return; }
+    if (tryIoStub(addr, 1, offset)) {
+        // Keep the trampoline at 0x04000000 intact (`BX LR`).
+        if (offset < 4) return;
+        io_stub_[offset] = value;
+        return;
+    }
     if (shouldLogUnmapped()) {
         if (has_current_access_pc_) {
             Logger::log("Memory: unmapped write8 pc=0x%08X addr=0x%08X value=0x%02X (no-op)\n",
@@ -376,6 +510,7 @@ void MemorySystem::write16(VAddr addr, u16 value) {
         return;
     }
     if (tryIoStub(addr, 2, offset)) {
+        if (offset < 4) return;
         io_stub_[offset] = static_cast<u8>(value);
         io_stub_[offset + 1] = static_cast<u8>(value >> 8);
         return;
@@ -410,6 +545,7 @@ void MemorySystem::write32(VAddr addr, u32 value) {
         return;
     }
     if (tryIoStub(addr, 4, offset)) {
+        if (offset < 4) return;
         io_stub_[offset] = static_cast<u8>(value);
         io_stub_[offset + 1] = static_cast<u8>(value >> 8);
         io_stub_[offset + 2] = static_cast<u8>(value >> 16);
