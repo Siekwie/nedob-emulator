@@ -944,7 +944,8 @@ thumb_unknown:
 
         const u32 shift_imm = (inst >> 7) & 0x1Fu;
         const u32 shift_type = (inst >> 5) & 0x3u; // 00 LSL, 01 LSR, 10 ASR, 11 ROR/RRX
-        u32 off = state_.r[rm];
+        // In ARM state, reads of R15 as an operand yield (PC + 8) due to the pipeline.
+        u32 off = (rm == 15) ? (state_.r[15] + 8u) : state_.r[rm];
         switch (shift_type) {
             case 0: // LSL
                 off = (shift_imm == 0) ? off : (off << shift_imm);

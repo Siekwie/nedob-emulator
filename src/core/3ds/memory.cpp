@@ -52,6 +52,18 @@ MemorySystem::MemorySystem() {
         system_info_mem_[tls_off + 3] = static_cast<u8>(tls_word >> 24);
     }
 
+    // Provide a couple kernel-config values that early crt0 checks.
+    // 0x1FF80040 is treated as a size/limit and compared against 0x046E8000 in Pokemon Sun.
+    // If this is 0, userland takes an early error path (panic loop).
+    constexpr std::size_t kCfg040Off = 0x40;
+    if (kCfg040Off + 4 <= system_info_mem_.size()) {
+        constexpr u32 kValue = 0x046E8000u;
+        system_info_mem_[kCfg040Off + 0] = static_cast<u8>(kValue);
+        system_info_mem_[kCfg040Off + 1] = static_cast<u8>(kValue >> 8);
+        system_info_mem_[kCfg040Off + 2] = static_cast<u8>(kValue >> 16);
+        system_info_mem_[kCfg040Off + 3] = static_cast<u8>(kValue >> 24);
+    }
+
     // Seed the first TLS word to a non-zero value. Some startup code uses an atomic
     // init routine that spins while this is zero.
     if (tls_mem_.size() >= 4) {
@@ -73,6 +85,9 @@ MemorySystem::MemorySystem() {
     }
     if (const char* v = std::getenv("NEDOB_PATCH_PANIC_LOOP"); v && v[0] == '1') {
         patch_panic_loop_ = true;
+    }
+    if (const char* v = std::getenv("NEDOB_PATCH_BOOT_ASSERT"); v && v[0] == '1') {
+        patch_boot_assert_ = true;
     }
     if (const char* v = std::getenv("NEDOB_LOG_PANIC_STRING"); v && v[0] == '1') {
         log_panic_string_ = true;
@@ -124,6 +139,40 @@ void MemorySystem::mapCode(VAddr vaddr, const u8* data, std::size_t size) {
     if (vaddr < PROCESS_MEMORY_VADDR_END && tryProcessMemory(vaddr, size, offset)) {
         if (offset + size <= process_memory_.size())
             std::memcpy(process_memory_.data() + offset, data, size);
+    }
+
+    // Dev-only bringup patches: apply immediately after code is mapped so the CPU sees the patched
+    // instructions on the first run.
+    if (patch_panic_loop_ || patch_boot_assert_) {
+        auto patchWord = [&](VAddr addr, u32 expected, u32 patched, const char* what) {
+            std::size_t off = 0;
+            if (!tryProcessMemory(addr, 4, off)) return;
+            const u32 w = static_cast<u32>(process_memory_[off + 0]) |
+                          (static_cast<u32>(process_memory_[off + 1]) << 8) |
+                          (static_cast<u32>(process_memory_[off + 2]) << 16) |
+                          (static_cast<u32>(process_memory_[off + 3]) << 24);
+            if (w == patched) return;
+            if (w != expected) return;
+            process_memory_[off + 0] = static_cast<u8>(patched);
+            process_memory_[off + 1] = static_cast<u8>(patched >> 8);
+            process_memory_[off + 2] = static_cast<u8>(patched >> 16);
+            process_memory_[off + 3] = static_cast<u8>(patched >> 24);
+            Logger::log("%s patch: wrote 0x%08X @0x%08X\n", what, patched, addr);
+        };
+
+        if (patch_panic_loop_) {
+            // 0x00104868: `BL 0x001074BC` -> `B 0x001074BC` (preserve LR)
+            patchWord(0x00104868u, 0xEB000B13u, 0xEA000B13u, "Panic");
+            // 0x001074D4: `BLX R2` -> `BX R2` (preserve LR)
+            patchWord(0x001074D4u, 0xE12FFF32u, 0xE12FFF12u, "Panic");
+            // 0x001074D8: `B 0x001074C0` -> `BX LR` (return)
+            patchWord(0x001074D8u, 0xEAFFFFF8u, 0xE12FFF1Eu, "Panic");
+        }
+
+        if (patch_boot_assert_) {
+            // 0x00104858: `BPL 0x00104874` -> unconditional `B 0x00104874`
+            patchWord(0x00104858u, 0x5A000005u, 0xEA000005u, "Boot");
+        }
     }
 }
 

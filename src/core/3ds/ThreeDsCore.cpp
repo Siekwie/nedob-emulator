@@ -7,6 +7,7 @@
 #include "../video/gsp_hle.hpp"
 #include "memory.hpp"
 #include "../../common/logger.hpp"
+#include <cstdlib>
 
 ThreeDS::ThreeDS() = default;
 
@@ -47,6 +48,17 @@ bool ThreeDS::loadROM(const std::string& path) {
     // Leave a small slack page below TLS so post-increment pops can't step into the TLS page.
     interpreter_->setSP(STACK_REGION_VADDR_END - 0x1000u); // R13
     interpreter_->setLR(0);                    // R14 = link register (set by first BL/BLX)
+
+    // Bringup hook: allow forcing initial callee-saved regs for titles whose crt0 assumes
+    // a non-zero ABI context in R5/R6. Keep it env-gated.
+    if (const char* v = std::getenv("NEDOB_BOOT_R5"); v && v[0] != '\0') {
+        const unsigned long r5 = std::strtoul(v, nullptr, 0);
+        interpreter_->state().r[5] = static_cast<u32>(r5);
+    }
+    if (const char* v = std::getenv("NEDOB_BOOT_R6"); v && v[0] != '\0') {
+        const unsigned long r6 = std::strtoul(v, nullptr, 0);
+        interpreter_->state().r[6] = static_cast<u32>(r6);
+    }
 
     gpu_ = std::make_unique<VideoCore::Gpu>(*memory_);
     gsp_hle_ = std::make_unique<GspHle>(*memory_, *gpu_);

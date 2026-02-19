@@ -4,6 +4,7 @@
 #include <SDL3/SDL_timer.h>
 #include <cstring>
 #include <algorithm>
+#include <memory>
 
 namespace {
     // Internal structure to pass callback data to SDL dialog
@@ -57,13 +58,15 @@ void FileSelector::showDialog(std::function<void(const RomSelectionResult&)> cal
     filters_ = getRomFilters();
     
     // Create callback data structure
-    auto* cb_data = new CallbackData{this, callback};
+    auto cb_data = std::make_unique<CallbackData>();
+    cb_data->selector = this;
+    cb_data->user_callback = std::move(callback);
     
     // Show the file dialog
     // Note: filters_ must remain valid until the callback is invoked
     SDL_ShowOpenFileDialog(
         dialogCallback,
-        cb_data,
+        cb_data.release(),  // callback takes ownership and deletes it
         window_,
         filters_.data(),
         static_cast<int>(filters_.size()),
@@ -83,7 +86,7 @@ RomSelectionResult FileSelector::showDialogSync(const char* default_path) {
     
     // Wait for dialog to complete by pumping events
     // Note: This requires the main event loop to be running
-    while (!completed && dialog_active_) {
+    while (!completed) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             // Process events to allow dialog callbacks to fire
@@ -100,12 +103,11 @@ RomSelectionResult FileSelector::showDialogSync(const char* default_path) {
 }
 
 void FileSelector::dialogCallback(void* userdata, const char* const* filelist, int filter) {
-    auto* cb_data = static_cast<CallbackData*>(userdata);
-    
-    cb_data->selector->dialog_active_ = false;
-    cb_data->selector->processDialogResult(filelist, filter, cb_data->user_callback);
-    
-    delete cb_data;
+    // Take ownership so we always free the callback data.
+    std::unique_ptr<CallbackData> cb_data(static_cast<CallbackData*>(userdata));
+    FileSelector* sel = cb_data->selector;
+    sel->processDialogResult(filelist, filter, std::move(cb_data->user_callback));
+    sel->dialog_active_ = false;
 }
 
 void FileSelector::processDialogResult(const char* const* filelist, int filter,
@@ -135,12 +137,6 @@ void FileSelector::processDialogResult(const char* const* filelist, int filter,
     
     // Detect ROM type from file extension
     result.rom_type = detectRomType(result.filepath);
-    
-    // If we couldn't detect the type, mark as unknown (but not an error)
-    if (result.rom_type == RomType::Unknown) {
-        // User might have selected a file with wrong extension
-        // We'll let the core handle validation
-    }
     
     callback(result);
     // Clear filters now that callback is done

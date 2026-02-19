@@ -9,6 +9,7 @@
 #include "application.hpp"
 #include "logger.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 
@@ -48,6 +49,21 @@ int main(int argc, char* argv[])
     bool rom_selected = false;
 
     if (kUseDevRomPath && std::filesystem::exists(kDevRomPath)) {
+        // Bringup defaults for the hardcoded dev ROM path. These can still be overridden by
+        // explicitly setting environment variables before launching the emulator.
+        if (std::getenv("NEDOB_BREAK_SPINS") == nullptr) {
+            ::setenv("NEDOB_BREAK_SPINS", "1", 1);
+        }
+        if (std::getenv("NEDOB_SPIN_THRESHOLD") == nullptr) {
+            ::setenv("NEDOB_SPIN_THRESHOLD", "20000", 1);
+        }
+        if (std::getenv("NEDOB_PATCH_PANIC_LOOP") == nullptr) {
+            ::setenv("NEDOB_PATCH_PANIC_LOOP", "1", 1);
+        }
+        if (std::getenv("NEDOB_LOG_PANIC_STRING") == nullptr) {
+            ::setenv("NEDOB_LOG_PANIC_STRING", "1", 1);
+        }
+
         result.filepath = kDevRomPath;
         result.rom_type = RomType::ThreeDS;
         result.cancelled = false;

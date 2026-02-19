@@ -23,6 +23,8 @@ public:
 
     FileSelector(const FileSelector&) = delete;
     FileSelector& operator=(const FileSelector&) = delete;
+    FileSelector(FileSelector&&) = delete;
+    FileSelector& operator=(FileSelector&&) = delete;
 
     void setWindow(SDL_Window* window);
 

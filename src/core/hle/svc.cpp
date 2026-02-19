@@ -105,11 +105,58 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
     }
 
     switch (svc_num) {
-        case 0x01:
-            Logger::log("ControlMemory: addr=0x%08X size=0x%08X op=0x%08X (R3=0x%08X)\n",
-                        cpu.state().r[0], cpu.state().r[1], cpu.state().r[2], cpu.state().r[3]);
+        case 0x01: {
+            // ControlMemory is used very early by crt0/allocators.
+            //
+            // Different SDKs/wrappers pass args differently, but a common convention is:
+            // - R0: operation
+            // - R1: addr hint (0 == anywhere)
+            // - R2: (unused or alignment/flags)
+            // - R3: size
+            // and the SVC returns:
+            // - R0: result (0 success)
+            // - R1: output address (chosen mapping base)
+            //
+            // For bringup, we don't model VM pages yet; process memory is a flat backing store.
+            // We still need to return a sane out address in R1 so userland doesn't store junk
+            // and later jump into unmapped space.
+            static u32 s_bump = HEAP_VADDR;
+
+            const u32 op = cpu.state().r[0];
+            const u32 hint = cpu.state().r[1];
+            const u32 size_in = cpu.state().r[3];
+
+            auto align_up = [](u32 v, u32 a) { return (v + (a - 1u)) & ~(a - 1u); };
+
+            u32 size = size_in;
+            if (size == 0 || size > (16u * 1024u * 1024u)) {
+                size = 0x1000u; // defensive default for garbage args during bringup
+            }
+            size = align_up(size, 0x1000u);
+
+            u32 out = 0;
+            const bool hint_usable = (hint >= HEAP_VADDR && hint < HEAP_VADDR_END);
+            if (hint_usable && (hint % 0x1000u) == 0) {
+                out = hint;
+            } else {
+                out = align_up(s_bump, 0x1000u);
+            }
+
+            // Advance bump pointer only for "allocate/commit"-like ops. We don't decode op here;
+            // this is purely to keep progress deterministic.
+            if (out == s_bump) {
+                s_bump = align_up(out + size, 0x1000u);
+                if (s_bump < HEAP_VADDR || s_bump >= HEAP_VADDR_END) {
+                    s_bump = HEAP_VADDR;
+                }
+            }
+
+            Logger::log("ControlMemory: op=0x%08X hint=0x%08X size=0x%08X -> out=0x%08X\n",
+                        op, hint, size_in, out);
             cpu.state().r[0] = 0;
+            cpu.state().r[1] = out;
             return true;
+        }
         case 0x02: {
             // QueryMemory(MemoryInfo* out, u32* out_pageinfo, u32 addr)
             // A lot of userland (crt0/libc/rtld) expects these outputs to be initialized.

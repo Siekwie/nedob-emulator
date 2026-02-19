@@ -198,6 +198,9 @@ private:
     bool tryIo(VAddr addr) const;
     bool tryIoStub(VAddr addr, std::size_t size, std::size_t& out_offset) const;
 
+    // Helper for CPU fetch guards: returns true if the address range is backed by any region.
+    bool isMapped(VAddr addr, std::size_t size) const;
+
     std::vector<u8> fcram_;
     std::vector<u8> process_memory_;
     std::vector<u8> shared_memory_tail_;
@@ -222,6 +225,7 @@ private:
     bool break_spins_enabled_{false};
     u32 spin_threshold_{500000};
     bool patch_panic_loop_{false};
+    bool patch_boot_assert_{false};
     bool log_panic_string_{false};
     bool panic_string_printed_{false};
     VAddr spin_last_addr_{0};
