@@ -4,6 +4,8 @@
 #include "../3ds/memory.hpp"
 #include "gsp_types.hpp"
 #include <memory>
+#include <string>
+#include <unordered_map>
 
 class ArmInterpreter;
 namespace VideoCore { class Gpu; }
@@ -24,8 +26,12 @@ public:
 private:
     void processGspRequest(ArmInterpreter& cpu);
     void processCommandBuffer(VAddr shared_vaddr);
+    u32 getOrCreateServiceHandle(const std::string& name);
 
     MemorySystem& memory_;
     VideoCore::Gpu& gpu_;
     VAddr gsp_shared_vaddr_{0};
+    std::unordered_map<u32, std::string> service_by_handle_{};
+    std::unordered_map<std::string, u32> handle_by_service_{};
+    u32 next_service_handle_{0x40};
 };

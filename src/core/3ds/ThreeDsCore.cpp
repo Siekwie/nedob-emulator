@@ -22,8 +22,15 @@ bool ThreeDS::loadROM(const std::string& path) {
 
     memory_ = std::make_unique<MemorySystem>();
     if (load_result.use_segment_mapping && !load_result.segments.empty()) {
+        const bool log_segs = (std::getenv("NEDOB_LOG_SEGMENTS") != nullptr);
+        if (log_segs) {
+            Logger::log("ThreeDS: mapping %zu segments:\n", load_result.segments.size());
+        }
         for (const auto& seg : load_result.segments) {
             if (!seg.data.empty()) {
+                if (log_segs) {
+                    Logger::log("  seg vaddr=0x%08X size=%zu\n", seg.vaddr, seg.data.size());
+                }
                 memory_->mapCode(seg.vaddr, seg.data.data(), seg.data.size());
             }
         }
@@ -32,6 +39,24 @@ bool ThreeDS::loadROM(const std::string& path) {
     }
     memory_->initProcessEnvironmentBlock(load_result.program_id);
     memory_->write32(4, 0xE12FFF1Eu);  // Boot vector at 0x4: BX LR (dead end if PC lands here)
+
+    // Dev helper: dump a few words from mapped memory to quickly sanity-check
+    // code/rodata placement without editing code.
+    // Format: NEDOB_DUMP_WORDS="0xADDR,COUNT" (COUNT is number of 32-bit words).
+    if (const char* v = std::getenv("NEDOB_DUMP_WORDS"); v && v[0] != '\0') {
+        unsigned long addr_ul = 0;
+        unsigned long count_ul = 0;
+        if (std::sscanf(v, "%lx,%lu", &addr_ul, &count_ul) == 2 && count_ul > 0 && count_ul <= 256ul) {
+            const u32 addr = static_cast<u32>(addr_ul);
+            const u32 count = static_cast<u32>(count_ul);
+            Logger::log("NEDOB_DUMP_WORDS: addr=0x%08X count=%u\n", addr, count);
+            for (u32 i = 0; i < count; ++i) {
+                const u32 a = addr + i * 4u;
+                const u32 w = memory_->read32(a);
+                Logger::log("  [0x%08X] = 0x%08X\n", a, w);
+            }
+        }
+    }
 
     timing_ = std::make_unique<CoreTiming>();
     timing_->reset();

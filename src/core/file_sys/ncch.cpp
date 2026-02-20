@@ -7,6 +7,72 @@ namespace {
 constexpr u32 MAGIC_NCCH = 0x4843434E;  // "NCCH"
 constexpr u32 MAGIC_NCSD = 0x4453434E;  // "NCSD"
 
+inline u32 readLe32(const u8* p) {
+    return static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8) | (static_cast<u32>(p[2]) << 16) |
+           (static_cast<u32>(p[3]) << 24);
+}
+
+// 3DS ExeFS `.code` reverse-LZSS decompression.
+// Matches the algorithm used by ctrtool (`--decompresscode`).
+// Footer (last 8 bytes):
+// - u32 buffertopandbottom
+// - u32 originalbottom
+bool decompressExeFsCodeReverseLzss(const std::vector<u8>& compressed, std::vector<u8>& decompressed) {
+    if (compressed.size() < 8) return false;
+
+    const std::size_t compressed_size = compressed.size();
+    const u8* footer = compressed.data() + compressed_size - 8;
+    const u32 buffertopandbottom = readLe32(footer + 0);
+    const u32 originalbottom = readLe32(footer + 4);
+
+    const std::size_t decompressed_size = static_cast<std::size_t>(originalbottom) + compressed_size;
+    if (decompressed_size <= compressed_size) return false;
+    if (decompressed_size > (128u * 1024u * 1024u)) return false;  // defensive cap
+
+    decompressed.assign(decompressed_size, 0);
+    std::memcpy(decompressed.data(), compressed.data(), compressed_size);
+
+    std::size_t out = decompressed_size;
+    std::size_t index = compressed_size - ((buffertopandbottom >> 24) & 0xFFu);
+    const std::size_t stop_index = compressed_size - (buffertopandbottom & 0x00FFFFFFu);
+
+    if (index > compressed_size || stop_index > compressed_size) return false;
+    if (stop_index > index) return false;
+
+    while (index > stop_index) {
+        const u8 control = compressed[--index];
+        u8 ctrl = control;
+
+        for (u32 i = 0; i < 8; ++i) {
+            if (index <= stop_index || index == 0 || out == 0) break;
+
+            if (ctrl & 0x80u) {
+                if (index < 2) return false;
+                index -= 2;
+
+                u32 seg = static_cast<u32>(compressed[index]) | (static_cast<u32>(compressed[index + 1]) << 8);
+                const std::size_t seg_size = static_cast<std::size_t>(((seg >> 12) & 0xFu) + 3u);
+                std::size_t seg_off = static_cast<std::size_t>(seg & 0x0FFFu);
+                seg_off += 2;
+
+                if (out < seg_size) return false;
+                for (std::size_t j = 0; j < seg_size; ++j) {
+                    if (out + seg_off >= decompressed_size) return false;
+                    const u8 data = decompressed[out + seg_off];
+                    decompressed[--out] = data;
+                }
+            } else {
+                if (index == 0 || out == 0) return false;
+                decompressed[--out] = compressed[--index];
+            }
+            ctrl <<= 1;
+        }
+    }
+
+    // Most blobs fully fill the output (out == 0). If it doesn't, it's still useful for debugging.
+    return true;
+}
+
 }  // namespace
 
 NcchResult NcchContainer::open(const std::string& path, u32 offset, u32 part) {
@@ -109,6 +175,26 @@ NcchResult NcchContainer::loadSectionCode(std::vector<u8>& buffer) {
             if (!file_.read(reinterpret_cast<char*>(buffer.data()), section_size)) {
                 return NcchResult::Error;
             }
+
+            // If exheader is present, we know the expected in-memory size of the code blob
+            // (text+ro+data, page-aligned). When `.code` is compressed, its file size is smaller.
+            if (has_exheader_) {
+                const std::size_t expected = static_cast<std::size_t>(exheader_.codeset_info.text.code_size) +
+                                             static_cast<std::size_t>(exheader_.codeset_info.ro.code_size) +
+                                             static_cast<std::size_t>(exheader_.codeset_info.data.code_size);
+                if (expected > 0 && buffer.size() != expected && buffer.size() < expected) {
+                    std::vector<u8> dec;
+                    if (decompressExeFsCodeReverseLzss(buffer, dec) && dec.size() == expected) {
+                        Logger::log("NCCH: decompressed ExeFS .code (reverse-LZSS) %zu -> %zu bytes\n",
+                                    buffer.size(), dec.size());
+                        buffer.swap(dec);
+                    } else {
+                        Logger::log("NCCH: WARNING: .code smaller than expected (%zu < %zu) but decompression failed\n",
+                                    buffer.size(), expected);
+                    }
+                }
+            }
+
             return NcchResult::Success;
         }
     }

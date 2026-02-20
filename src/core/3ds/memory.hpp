@@ -186,6 +186,9 @@ public:
     /// Convert virtual to physical address for GPU. Returns vaddr if no translation.
     VAddr virtualToPhysical(VAddr vaddr) const;
 
+    /// Helper for CPU fetch guards: returns true if the address range is backed by any region.
+    bool isMapped(VAddr addr, std::size_t size) const;
+
 private:
     bool tryFcram(VAddr addr, std::size_t size, std::size_t& out_offset) const;
     bool tryProcessMemory(VAddr addr, std::size_t size, std::size_t& out_offset) const;
@@ -197,9 +200,6 @@ private:
     bool tryStack(VAddr addr, std::size_t size, std::size_t& out_offset) const;
     bool tryIo(VAddr addr) const;
     bool tryIoStub(VAddr addr, std::size_t size, std::size_t& out_offset) const;
-
-    // Helper for CPU fetch guards: returns true if the address range is backed by any region.
-    bool isMapped(VAddr addr, std::size_t size) const;
 
     std::vector<u8> fcram_;
     std::vector<u8> process_memory_;

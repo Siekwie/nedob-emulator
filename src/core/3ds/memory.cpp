@@ -285,6 +285,21 @@ VAddr MemorySystem::virtualToPhysical(VAddr vaddr) const {
     return vaddr;
 }
 
+bool MemorySystem::isMapped(VAddr addr, std::size_t size) const {
+    std::size_t off = 0;
+    if (tryProcessMemory(addr, size, off)) return true;
+    if (trySharedMemoryTail(addr, size, off)) return true;
+    if (tryVram(addr, size, off)) return true;
+    if (trySystemInfo(addr, size, off)) return true;
+    if (trySharedPage(addr, size, off)) return true;
+    if (tryTls(addr, size, off)) return true;
+    if (tryStack(addr, size, off)) return true;
+    if (tryIoStub(addr, size, off)) return true;
+    if (tryFcram(addr, size, off)) return true;
+    if (tryIo(addr)) return true;
+    return false;
+}
+
 u8 MemorySystem::read8(VAddr addr) {
     std::size_t offset = 0;
     if (tryTls(addr, 1, offset)) return tls_mem_[offset];
@@ -576,6 +591,18 @@ void MemorySystem::write16(VAddr addr, u16 value) {
 
 void MemorySystem::write32(VAddr addr, u32 value) {
     if (addr >= STACK_TLS_VADDR && addr < (STACK_TLS_VADDR + 4)) return;
+    // Optional bringup watchpoint: NEDOB_WATCH_WRITE32=0xADDR
+    static bool s_watch_inited = false;
+    static u32 s_watch_addr = 0;
+    if (!s_watch_inited) {
+        s_watch_inited = true;
+        if (const char* v = std::getenv("NEDOB_WATCH_WRITE32"); v && v[0] != '\0') {
+            const unsigned long a = std::strtoul(v, nullptr, 0);
+            s_watch_addr = static_cast<u32>(a);
+        }
+    }
+    const bool watch_hit = (s_watch_addr != 0 && addr == s_watch_addr);
+
     std::size_t offset = 0;
     auto* buf = tryTls(addr, 4, offset) ? &tls_mem_
         : tryStack(addr, 4, offset) ? &stack_mem_
@@ -587,6 +614,10 @@ void MemorySystem::write32(VAddr addr, u32 value) {
         : tryVram(addr, 4, offset) ? (addr >= VRAM_VADDR && addr < VRAM_VADDR_END ? &vram_ : &fcram_)
         : nullptr;
     if (buf) {
+        if (watch_hit) {
+            Logger::log("WATCH write32 pc=0x%08X addr=0x%08X value=0x%08X\n",
+                        has_current_access_pc_ ? current_access_pc_ : 0u, addr, value);
+        }
         (*buf)[offset] = static_cast<u8>(value);
         (*buf)[offset + 1] = static_cast<u8>(value >> 8);
         (*buf)[offset + 2] = static_cast<u8>(value >> 16);

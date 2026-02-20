@@ -104,7 +104,7 @@ constexpr u32 MASK_LDRSTR = 0x0DE00000u;
 constexpr u32 MASK_MOV_OP = 0x00E00000u;  // opcode bits 24-21 only (op1)
 constexpr u32 VAL_MOV_OP = 0x00D00000u;   // op1=0xD = MOV (register)
 constexpr u32 MASK_BLX_REG = 0x0FFFFFF0u;
-constexpr u32 MASK_NOP = 0x0FFFFFF0u;
+constexpr u32 MASK_NOP = 0x0FFFFFFFu;
 constexpr u32 MASK_SVC = 0x0F000000u;   // SVC: bits 27-24 = 1111
 constexpr u32 VAL_SVC = 0x0F000000u;
 
@@ -316,6 +316,27 @@ bool ArmInterpreter::execute() {
     const u32 pc = state_.r[15];
     // Feed the memory system with best-effort PC context so unmapped accesses can be attributed.
     memory_.setCurrentAccessPC(pc);
+
+    // Bringup guard: stop immediately if we ever fetch from an unmapped PC.
+    // This prevents multi-GB logs of "unmapped read16" when we jump to garbage.
+    static u32 s_prev_pc_guard = 0;
+    const u32 prev_pc_guard = s_prev_pc_guard;
+    const bool is_thumb = (state_.cpsr & CPSR_T) != 0;
+    const u32 fetch_size = is_thumb ? 2u : 4u;
+    if (!memory_.isMapped(pc, fetch_size)) {
+        Logger::log(
+            "CPU: unmapped instruction fetch PC=0x%08X (T=%u) prevPC=0x%08X LR=0x%08X SP=0x%08X CPSR=0x%08X\n",
+            pc, is_thumb ? 1u : 0u, prev_pc_guard, state_.r[14], state_.r[13], state_.cpsr);
+        if (prev_pc_guard != 0 && memory_.isMapped(prev_pc_guard, 4)) {
+            memory_.setCurrentAccessPC(prev_pc_guard);
+            const u32 prev_inst = memory_.read32(prev_pc_guard);
+            Logger::log("CPU: previous inst @0x%08X = 0x%08X\n", prev_pc_guard, prev_inst);
+            memory_.setCurrentAccessPC(pc);
+        }
+        return false;
+    }
+    s_prev_pc_guard = pc;
+
     if (pc >= 0x0FFFF000u && pc < 0x10000000u) {
         Logger::log("Stack Execution Detected - Probable Crash  PC=0x%08X  LR(R14)=0x%08X  SP(R13)=0x%08X\n",
                     pc, state_.r[14], state_.r[13]);
@@ -330,6 +351,43 @@ bool ArmInterpreter::execute() {
                     pc, s_prev_pc, state_.r[14], state_.r[13]);
     }
     s_prev_pc = pc;
+
+    // Bringup helper: break the known ARM atomic wait loop reached during early Pokemon Sun boot.
+    // In a single-thread/no-scheduler environment this loop can spin forever waiting for a value
+    // another thread would normally publish. We emulate forward progress by forcing the polled word
+    // negative after repeated spins so the wait path can continue.
+    static bool s_mutex_wait_patch_init = false;
+    static bool s_mutex_wait_patch_enabled = true;
+    static u32 s_mutex_wait_prev_addr = 0;
+    static u32 s_mutex_wait_spin_count = 0;
+    if (!s_mutex_wait_patch_init) {
+        s_mutex_wait_patch_init = true;
+        if (const char* v = std::getenv("NEDOB_PATCH_MUTEX_WAIT"); v && v[0] == '0') {
+            s_mutex_wait_patch_enabled = false;
+        }
+    }
+    if (s_mutex_wait_patch_enabled) {
+        const bool in_mutex_wait_loop =
+            (pc == 0x00108C2Cu || pc == 0x00108C30u || pc == 0x00108C34u || pc == 0x00108C38u ||
+             pc == 0x00108C54u || pc == 0x00108C58u || pc == 0x00108C5Cu || pc == 0x00108C60u ||
+             pc == 0x00108C64u || pc == 0x00108C80u || pc == 0x00108C84u);
+        if (in_mutex_wait_loop) {
+            const u32 addr = state_.r[0];
+            if (addr == s_mutex_wait_prev_addr) {
+                ++s_mutex_wait_spin_count;
+            } else {
+                s_mutex_wait_prev_addr = addr;
+                s_mutex_wait_spin_count = 1;
+            }
+            if (s_mutex_wait_spin_count == 4096u && memory_.isMapped(addr, 4u)) {
+                Logger::log("CPU: patching mutex wait word at 0x%08X after spin loop at PC=0x%08X\n", addr, pc);
+                memory_.write32(addr, 0xFFFFFFFFu);
+            }
+        } else {
+            s_mutex_wait_spin_count = 0;
+            s_mutex_wait_prev_addr = 0;
+        }
+    }
 
     // Thumb state: minimal Thumb-16 support (enough to get through common veneers/trampolines).
     // The 3DS userland binaries do use interworking, so we must honor CPSR.T on BX/BLX.
@@ -1153,15 +1211,86 @@ thumb_unknown:
                                 state_.r[15], state_.r[14], target & ~1u, (target & 1u) ? " (thumb)" : "");
                 }
             }
-            if (is_blx)
+            if (is_blx) {
                 writeReg(14, state_.r[15] + 4);
-            if ((target & 1u) != 0) state_.cpsr |= CPSR_T;
+            }
+
+            // Bringup escape hatch: if we call through a function pointer that is totally unmapped,
+            // allow skipping the call instead of spamming unmapped fetches.
+            // Enable with NEDOB_SKIP_UNMAPPED_CALLS=1.
+            static bool s_skip_unmapped_calls_inited = false;
+            static bool s_skip_unmapped_calls = false;
+            if (!s_skip_unmapped_calls_inited) {
+                s_skip_unmapped_calls_inited = true;
+                if (const char* v = std::getenv("NEDOB_SKIP_UNMAPPED_CALLS"); v && v[0] == '1') {
+                    s_skip_unmapped_calls = true;
+                }
+            }
+
+            const u32 target_addr = target & ~1u;
+            const bool target_thumb = (target & 1u) != 0;
+            const u32 target_fetch = target_thumb ? 2u : 4u;
+            if (s_skip_unmapped_calls && is_blx && !memory_.isMapped(target_addr, target_fetch)) {
+                Logger::log("CPU: skipping unmapped BLX target=0x%08X from PC=0x%08X (LR=0x%08X)\n",
+                            target_addr, state_.r[15], state_.r[14]);
+                const u32 ret = state_.r[14];
+                if ((ret & 1u) != 0) state_.cpsr |= CPSR_T;
+                else state_.cpsr &= ~CPSR_T;
+                state_.r[15] = ret & ~1u;
+                return true;
+            }
+
+            if (target_thumb) state_.cpsr |= CPSR_T;
             else state_.cpsr &= ~CPSR_T;
-            state_.r[15] = target & ~1u;
+            state_.r[15] = target_addr;
             return true;
         }
 
         if ((inst & MASK_NOP) == 0x01A00000) {
+            advancePC();
+            return true;
+        }
+
+        // ARMv6T2 wide-immediate moves.
+        // MOVW Rd, #imm16 : Rd = imm16
+        // MOVT Rd, #imm16 : Rd[31:16] = imm16, lower half unchanged.
+        if ((inst & 0x0FF00000u) == 0x03000000u || (inst & 0x0FF00000u) == 0x03400000u) {
+            const bool is_movt = (inst & 0x00400000u) != 0;
+            const u32 rd = Rd(inst);
+            const u32 imm4 = (inst >> 16) & 0xFu;
+            const u32 imm12 = inst & 0xFFFu;
+            const u32 imm16 = (imm4 << 12) | imm12;
+            if (is_movt) {
+                const u32 value = (state_.r[rd] & 0x0000FFFFu) | (imm16 << 16);
+                writeReg(rd, value);
+            } else {
+                writeReg(rd, imm16);
+            }
+            advancePC();
+            return true;
+        }
+
+        // ARMv6 exclusive accesses used by atomics:
+        //   LDREX Rt, [Rn]
+        //   STREX Rd, Rt, [Rn]
+        // Single-core bringup model: STREX always succeeds (Rd=0) and writes immediately.
+        if ((inst & 0x0FF00FF0u) == 0x01900F90u) {  // LDREX
+            const u32 rt = Rd(inst);
+            const u32 rn = Rn(inst);
+            const u32 addr = (rn == 15) ? (pc + 8u) : state_.r[rn];
+            const u32 val = memory_.read32(addr);
+            writeReg(rt, val);
+            advancePC();
+            return true;
+        }
+        if ((inst & 0x0FF00FF0u) == 0x01800F90u) {  // STREX
+            const u32 rn = Rn(inst);
+            const u32 rd = Rd(inst);      // status result
+            const u32 rt = Rm(inst);      // value source register (bits[3:0] in this encoding)
+            const u32 addr = (rn == 15) ? (pc + 8u) : state_.r[rn];
+            logStackRegionWrite(addr, state_.r[rt], state_.r[13], state_.r[15]);
+            memory_.write32(addr, state_.r[rt]);
+            writeReg(rd, 0u);             // success
             advancePC();
             return true;
         }

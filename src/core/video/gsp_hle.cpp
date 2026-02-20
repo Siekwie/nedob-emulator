@@ -35,25 +35,39 @@ bool GspHle::handleConnectToPort(ArmInterpreter& cpu) {
         if (name[i] == '\0') break;
     }
     if (std::strcmp(name, "gsp::Gpu") == 0) {
-        memory_.write32(out_handle_ptr, GSP_GPU_HANDLE);
+        cpu.state().r[1] = GSP_GPU_HANDLE;  // 3DS ABI: handle returned in R1
         cpu.state().r[0] = 0;  // success
-        Logger::logInfo("GSP: ConnectToPort gsp::Gpu -> success\n");
+        Logger::logInfo("GSP: ConnectToPort gsp::Gpu -> success (R1=0x%08X, out=0x%08X)\n",
+                        cpu.state().r[1], out_handle_ptr);
     } else if (std::strcmp(name, "srv:") == 0 || name[0] == '\0' || std::strstr(name, "srv") != nullptr) {
-        memory_.write32(out_handle_ptr, SRV_HANDLE);
+        cpu.state().r[1] = SRV_HANDLE;  // returned in R1; caller stores it
         cpu.state().r[0] = 0;  // success (early boot: return srv: even if name hard to read)
-        Logger::logInfo("GSP: ConnectToPort %s -> srv: success\n", name[0] ? name : "(empty)");
+        Logger::logInfo("GSP: ConnectToPort %s -> srv: success (R1=0x%08X, out=0x%08X)\n",
+                        name[0] ? name : "(empty)", cpu.state().r[1], out_handle_ptr);
     } else {
-        memory_.write32(out_handle_ptr, SRV_HANDLE);
+        cpu.state().r[1] = SRV_HANDLE;  // default to srv handle for bringup
         cpu.state().r[0] = 0;  // success: always return valid handle so boot continues
-        Logger::logInfo("GSP: ConnectToPort %s -> default srv: handle\n", name);
+        Logger::logInfo("GSP: ConnectToPort %s -> default srv: handle (R1=0x%08X, out=0x%08X)\n",
+                        name, cpu.state().r[1], out_handle_ptr);
     }
     return true;
 }
 
 namespace {
-constexpr u32 CMD_BUF_TLS_VADDR = 0x0FFFF800;  // Command buffer in TLS for IPC
+constexpr u32 CMD_BUF_TLS_VADDR = 0x0FFFF080;  // Thread command buffer at TLS + 0x80
 constexpr u32 IPC_HEADER_SUCCESS = 0x00010040;
 }  // namespace
+
+u32 GspHle::getOrCreateServiceHandle(const std::string& name) {
+    if (name == "gsp::Gpu") return GSP_GPU_HANDLE;
+    if (name == "srv:") return SRV_HANDLE;
+    const auto it = handle_by_service_.find(name);
+    if (it != handle_by_service_.end()) return it->second;
+    const u32 h = next_service_handle_++;
+    handle_by_service_[name] = h;
+    service_by_handle_[h] = name;
+    return h;
+}
 
 bool GspHle::handleSendSyncRequest(ArmInterpreter& cpu) {
     const u32 handle = cpu.state().r[0];
@@ -66,21 +80,54 @@ bool GspHle::handleSendSyncRequest(ArmInterpreter& cpu) {
     }
     Logger::log("%s\n", buf);
     if (handle == SRV_HANDLE) {
-        memory_.write32(CMD_BUF_TLS_VADDR, IPC_HEADER_SUCCESS);
+        const u32 req_header = memory_.read32(CMD_BUF_TLS_VADDR + 0);
+        const u32 cmd_id = (req_header >> 16) & 0xFFFFu;
+        const u32 resp_header = (cmd_id << 16) | 0x40u;  // normal response shape
+        memory_.write32(CMD_BUF_TLS_VADDR + 0, resp_header);
+        memory_.write32(CMD_BUF_TLS_VADDR + 1 * 4, 0);  // ResultCode = 0 (success)
+
+        // SRV basic commands needed by early runtime init.
+        if (cmd_id == 0x1) {
+            // RegisterClient
+            Logger::logInfo("SRV: RegisterClient\n");
+        } else if (cmd_id == 0x5) {
+            // GetServiceHandleDirect
+            char name_buf[9]{};
+            const u32 w1 = memory_.read32(CMD_BUF_TLS_VADDR + 1 * 4);
+            const u32 w2 = memory_.read32(CMD_BUF_TLS_VADDR + 2 * 4);
+            std::memcpy(&name_buf[0], &w1, 4);
+            std::memcpy(&name_buf[4], &w2, 4);
+            name_buf[8] = '\0';
+            std::string service_name(name_buf);
+            // Trim at first NUL if any.
+            const auto nul = service_name.find('\0');
+            if (nul != std::string::npos) service_name.resize(nul);
+            const u32 out_handle = getOrCreateServiceHandle(service_name);
+            memory_.write32(CMD_BUF_TLS_VADDR + 3 * 4, out_handle);
+            Logger::logInfo("SRV: GetServiceHandle('%s') -> 0x%08X\n", service_name.c_str(), out_handle);
+        } else {
+            Logger::logInfo("SRV: unhandled cmd_id=0x%X (stub success)\n", cmd_id);
+        }
+
         cpu.state().r[0] = 0;
         return true;
     }
-    if (handle == GSP_GPU_HANDLE) {
-        const u32 cmd = cpu.state().r[1];
+    if (handle == GSP_GPU_HANDLE || (service_by_handle_.count(handle) && service_by_handle_[handle] == "gsp::Gpu")) {
+        const u32 cmd = memory_.read32(CMD_BUF_TLS_VADDR + 0);
         static u32 log_count = 0;
         if (log_count++ < 50) {
             Logger::logInfo("GSP: SendSyncRequest cmd=0x%08X\n", cmd);
         }
         processGspRequest(cpu);
+        cpu.state().r[0] = 0;
+        return true;
     }
-    if (handle == GSP_GPU_HANDLE || handle == SRV_HANDLE) {
-        cpu.state().r[0] = 0;  // success so game does not hang waiting
-    }
+
+    // Generic HLE response for unknown service handles (early bringup):
+    // return success so titles can continue probing services.
+    memory_.write32(CMD_BUF_TLS_VADDR + 0, IPC_HEADER_SUCCESS);
+    memory_.write32(CMD_BUF_TLS_VADDR + 1 * 4, 0);
+    cpu.state().r[0] = 0;
     return true;
 }
 

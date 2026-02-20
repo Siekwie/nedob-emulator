@@ -83,21 +83,13 @@ void SvcDispatcher::setHandler(u32 svc_num, SvcDispatchFn fn) {
 
 bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
     const auto& r = cpu.state().r;
-    Logger::log("SVC 0x%02X %s  R0=0x%08X R1=0x%08X R2=0x%08X R3=0x%08X  PC=0x%08X\n",
-                svc_num, getSvcName(svc_num), r[0], r[1], r[2], r[3], cpu.getPC());
-
-    if (svc_num == 0x2D && svc_num < kMaxSvc && handlers_[0x2D]) {
-        const u32 out_ptr = cpu.state().r[0];
-        const u32 name_ptr = cpu.state().r[1];
-        const bool cont = handlers_[0x2D](svc_num, cpu);
-        if (cont && cpu.state().r[0] != 0) {
-            std::string name = readStringFromMemory(cpu.memory_, name_ptr);
-            Logger::log("ConnectToPort: %s\n", name.c_str());
-            u32 h = allocHandle(name);
-            cpu.memory_.write32(out_ptr, h);
-            cpu.state().r[0] = 0;
-        }
-        return cont;
+    // QueryMemory can be called in very tight probe loops; default to quiet unless explicitly enabled.
+    const bool log_query_memory = (std::getenv("NEDOB_LOG_QUERYMEMORY") != nullptr);
+    const bool log_arbitrate = (std::getenv("NEDOB_LOG_ARBITRATE") != nullptr);
+    const bool suppress_spam = (svc_num == 0x02 && !log_query_memory) || (svc_num == 0x22 && !log_arbitrate);
+    if (!suppress_spam) {
+        Logger::log("SVC 0x%02X %s  R0=0x%08X R1=0x%08X R2=0x%08X R3=0x%08X  PC=0x%08X\n",
+                    svc_num, getSvcName(svc_num), r[0], r[1], r[2], r[3], cpu.getPC());
     }
 
     if (svc_num < kMaxSvc && handlers_[svc_num]) {
@@ -236,16 +228,18 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
                 perm = PERM_R | PERM_X;
                 state = STATE_COMMITTED;
                 set_region(PROCESS_IMAGE_VADDR, PROCESS_IMAGE_VADDR_END);
-            } else if (addr < PROCESS_MEMORY_VADDR_END) {
-                // Flat process memory mapping: treat as committed RW by default.
-                perm = PERM_R | PERM_W;
-                state = STATE_COMMITTED;
-                set_region(0, PROCESS_MEMORY_VADDR_END);
             }
 
+            // ABI: return MemoryInfo fields in registers and (optionally) mirror to out pointers.
+            // Many libctru wrappers copy R1-R4/R5 into user buffers after the SVC returns.
             writeMemoryInfo(cpu.memory_, out_meminfo, base, size, perm, state);
             writePageInfo(cpu.memory_, out_pageinfo, 0);
-            cpu.state().r[0] = 0;
+            cpu.state().r[0] = 0;      // Result
+            cpu.state().r[1] = base;   // MemoryInfo.base_addr
+            cpu.state().r[2] = size;   // MemoryInfo.size
+            cpu.state().r[3] = perm;   // MemoryInfo.perm
+            cpu.state().r[4] = state;  // MemoryInfo.state
+            cpu.state().r[5] = 0;      // PageInfo.flags
             return true;
         }
         case 0x38: {
@@ -266,10 +260,45 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
             cpu.state().r[0] = 0;
             return true;
         }
-        case 0x22:
+        case 0x22: {
+            // ArbitrateAddress(Handle arbiter, u32 addr, u32 type, s32 value, s64 timeout_ns)
+            // Minimal single-thread model:
+            // emulate waiter wakeups by adjusting the arbitration word instead of blocking.
+            // This keeps lock/futex-style userspace code progressing during bringup.
+            const u32 addr = cpu.state().r[1];
+            const u32 type = cpu.state().r[2];
+            const s32 value = static_cast<s32>(cpu.state().r[3]);
+            if (addr != 0 && cpu.memory_.isMapped(addr, 4u)) {
+                s32 cur = static_cast<s32>(cpu.memory_.read32(addr));
+                switch (type) {
+                    case 0: { // SIGNAL
+                        // In real kernel this wakes waiters; here we just move the word out of "waiting" range.
+                        if (cur < 0) cur = 0;
+                        break;
+                    }
+                    case 1: { // WAIT_IF_LESS_THAN
+                        if (cur < value) cur = value;
+                        break;
+                    }
+                    case 2: { // DECREMENT_AND_WAIT_IF_LESS_THAN
+                        --cur;
+                        if (cur < value) cur = value;
+                        break;
+                    }
+                    case 3: // WAIT_IF_LESS_THAN_TIMEOUT
+                    case 4: { // DECREMENT_AND_WAIT_IF_LESS_THAN_TIMEOUT
+                        if (type == 4) --cur;
+                        if (cur < value) cur = value;
+                        break;
+                    }
+                    default:
+                        break;
+                }
+                cpu.memory_.write32(addr, static_cast<u32>(cur));
+            }
             cpu.state().r[0] = 0;
-            cpu.state().r[1] = 0x00000008u;  // GetProcessId: process ID in R1 (3DS ABI), must be non-zero
             return true;
+        }
         case 0x19: {
             u32 id = allocHandle("Thread");
             cpu.state().r[0] = 0;
@@ -338,7 +367,9 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
             return true;
         }
         case 0x21: {
-            u32 id = allocHandle("Event");
+            // CreateAddressArbiter(Handle* out)
+            // Used for userland futex-like waits/wakes (very early during runtime init).
+            u32 id = allocHandle("AddressArbiter");
             cpu.state().r[0] = 0;
             cpu.state().r[1] = id;
             return true;
@@ -381,6 +412,8 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
             // type 0 is commonly used for "process ID" or similar metadata in some runtimes;
             // return a stable non-zero to avoid divide-by-zero / sentinel checks.
             if (type == 0) value = 0x0000000000000008ULL;
+            // Early Pokemon Sun runtime probes type 0x14 and expects a non-zero capability/count.
+            if (type == 0x14u) value = 1;
             if (out_ptr != 0) cpu.memory_.write64(out_ptr, value);
             cpu.state().r[0] = 0;
             return true;

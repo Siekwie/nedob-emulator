@@ -158,6 +158,11 @@ public:
     /// Get text segment size (code_size).
     u32 getTextSize() const { return exheader_.codeset_info.text.code_size; }
 
+    /// Get max pages for each code segment (page size 0x1000).
+    u32 getTextMaxPages() const { return exheader_.codeset_info.text.num_max_pages; }
+    u32 getRoMaxPages() const { return exheader_.codeset_info.ro.num_max_pages; }
+    u32 getDataMaxPages() const { return exheader_.codeset_info.data.num_max_pages; }
+
     /// Get program ID.
     u64 getProgramId() const { return ncch_header_.program_id; }
 
