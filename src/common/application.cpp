@@ -4,6 +4,7 @@
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_render.h>
 #include <SDL3/SDL_video.h>
+#include <cstdlib>
 
 Application::Application() = default;
 
@@ -55,6 +56,11 @@ void Application::run() {
     }
 
     bool running = true;
+    u64 max_frames = 0;
+    if (const char* v = std::getenv("NEDOB_MAX_FRAMES"); v && v[0] != '\0') {
+        const unsigned long long parsed = std::strtoull(v, nullptr, 0);
+        max_frames = static_cast<u64>(parsed);
+    }
     while (running) {
         processEvents(running);
 
@@ -63,6 +69,12 @@ void Application::run() {
         }
 
         renderFrame();
+        if (max_frames > 0 && frame_count_ >= max_frames) {
+            Logger::logInfo("Application: reached frame limit (%llu), stopping.\n",
+                            static_cast<unsigned long long>(max_frames));
+            running = false;
+            continue;
+        }
         SDL_Delay(16);
     }
 }

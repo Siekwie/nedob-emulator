@@ -7,7 +7,7 @@ namespace {
 constexpr u32 MAGIC_NCCH = 0x4843434E;  // "NCCH"
 constexpr u32 MAGIC_NCSD = 0x4453434E;  // "NCSD"
 
-inline u32 readLe32(const u8* p) {
+inline u32 readLe32Ptr(const u8* p) {
     return static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8) | (static_cast<u32>(p[2]) << 16) |
            (static_cast<u32>(p[3]) << 24);
 }
@@ -22,8 +22,8 @@ bool decompressExeFsCodeReverseLzss(const std::vector<u8>& compressed, std::vect
 
     const std::size_t compressed_size = compressed.size();
     const u8* footer = compressed.data() + compressed_size - 8;
-    const u32 buffertopandbottom = readLe32(footer + 0);
-    const u32 originalbottom = readLe32(footer + 4);
+    const u32 buffertopandbottom = readLe32Ptr(footer + 0);
+    const u32 originalbottom = readLe32Ptr(footer + 4);
 
     const std::size_t decompressed_size = static_cast<std::size_t>(originalbottom) + compressed_size;
     if (decompressed_size <= compressed_size) return false;
@@ -182,7 +182,7 @@ NcchResult NcchContainer::loadSectionCode(std::vector<u8>& buffer) {
                 const std::size_t expected = static_cast<std::size_t>(exheader_.codeset_info.text.code_size) +
                                              static_cast<std::size_t>(exheader_.codeset_info.ro.code_size) +
                                              static_cast<std::size_t>(exheader_.codeset_info.data.code_size);
-                if (expected > 0 && buffer.size() != expected && buffer.size() < expected) {
+                if (expected > 0 && buffer.size() < expected) {
                     std::vector<u8> dec;
                     if (decompressExeFsCodeReverseLzss(buffer, dec) && dec.size() == expected) {
                         Logger::log("NCCH: decompressed ExeFS .code (reverse-LZSS) %zu -> %zu bytes\n",
@@ -192,6 +192,9 @@ NcchResult NcchContainer::loadSectionCode(std::vector<u8>& buffer) {
                         Logger::log("NCCH: WARNING: .code smaller than expected (%zu < %zu) but decompression failed\n",
                                     buffer.size(), expected);
                     }
+                } else if (expected > 0 && buffer.size() > expected) {
+                    Logger::log("NCCH: WARNING: .code larger than expected (%zu > %zu)\n",
+                                buffer.size(), expected);
                 }
             }
 

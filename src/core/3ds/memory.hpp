@@ -2,6 +2,7 @@
 
 #include "../../common/common_types.hpp"
 #include <cstddef>
+#include <utility>
 #include <vector>
 
 /// Physical memory regions as seen from the ARM11
@@ -188,6 +189,10 @@ public:
 
     /// Helper for CPU fetch guards: returns true if the address range is backed by any region.
     bool isMapped(VAddr addr, std::size_t size) const;
+    /// Register an executable virtual range (text/code). If no ranges are registered, execution checks allow all mapped addresses.
+    void registerExecutableRange(VAddr addr, std::size_t size);
+    /// Returns true when [addr, addr+size) lies inside any registered executable range.
+    bool isExecutable(VAddr addr, std::size_t size) const;
 
 private:
     bool tryFcram(VAddr addr, std::size_t size, std::size_t& out_offset) const;
@@ -198,7 +203,7 @@ private:
     bool trySharedPage(VAddr addr, std::size_t size, std::size_t& out_offset) const;
     bool tryTls(VAddr addr, std::size_t size, std::size_t& out_offset) const;
     bool tryStack(VAddr addr, std::size_t size, std::size_t& out_offset) const;
-    bool tryIo(VAddr addr) const;
+    bool tryIo(VAddr addr, std::size_t size) const;
     bool tryIoStub(VAddr addr, std::size_t size, std::size_t& out_offset) const;
 
     std::vector<u8> fcram_;
@@ -210,6 +215,7 @@ private:
     std::vector<u8> stack_mem_;
     std::vector<u8> tls_mem_;
     std::vector<u8> io_stub_;
+    std::vector<std::pair<VAddr, VAddr>> executable_ranges_;
     unsigned unmapped_log_count_{0};
     u32 current_access_pc_{0};
     bool has_current_access_pc_{false};
@@ -237,5 +243,5 @@ private:
     void logUnmappedSuppressedOnce();
 
     static constexpr unsigned kMaxUnmappedLogPerFrame = 8;
-    static constexpr u64 kMaxUnmappedLogTotal = 2000;
+    static constexpr u64 kMaxUnmappedLogTotal = 256;
 };

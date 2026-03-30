@@ -1,7 +1,7 @@
-- Work with clarity not by guessing.
-- If you encounter a unfimiliar topic, dont hesitate to search the web, usually its always a solved problem.
-- Remember to not get stuck in loops of trying to solve one problem the same way over and over again
-- When coding something to see if behaviour changes and it does not, then the change probably wasnt what you thought and also wont help so dont forget to delete non working fixes, those clutter the codebase and lead to undefined behaviour
-- I know when making complex projects its easy to stub everything and continue from that point on, i have very bad experience this leads to struggles falling in weird pitfalls because of systems always beeing halfly implemented and otherwise not working, so pleae avoid using them, just code it out, as in previous comments told nearly everything is a solved problem. stubs only make it harder to debug at the end.
-- When needing to caclulate values or do caclulations or other operations of sortes we have the /dev directory where you store and make python scripts that you can reuse for easy script base.
-- Remember to not generate very large amounts of command outputs during tracing, rather log to files and grep that one or whatever but dont overload every buffer in existance so even you harness crashes...
+- Work with clarity, not by guessing.
+- If you encounter an unfamiliar topic, don't hesitate to search the web; usually it's already a solved problem.
+- Remember not to get stuck in loops of trying to solve one problem the same way over and over again.
+- When coding something to see if behavior changes and it does not, then the change probably wasn't what you thought and also won't help, so don't forget to delete non-working fixes; those clutter the codebase and lead to undefined behavior.
+- I know that when making complex projects it's easy to stub everything and continue from that point on. I have very bad experience with this; it leads to weird pitfalls because systems are half-implemented and otherwise not working, so please avoid using stubs. Just code it out. As in previous comments, nearly everything is a solved problem. Stubs only make it harder to debug at the end.
+- When needing to calculate values, do calculations, or other operations of sorts, we have the `/dev` directory where you store and make Python scripts that you can reuse.
+- Remember not to generate very large amounts of command output during tracing. Log to files and then grep those if needed, but don't overload every buffer in existence so even your harness crashes.

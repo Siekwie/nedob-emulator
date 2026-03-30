@@ -2,6 +2,7 @@
 #include "../3ds/memory.hpp"
 #include "../../common/logger.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -231,7 +232,12 @@ u32 getOp2DataProcessing(ArmInterpreter& cpu, u32 inst) {
         case 0: return shift_imm ? (rm_val << shift_imm) : rm_val;
         case 1: return shift_imm ? (rm_val >> shift_imm) : rm_val;
         case 2: return static_cast<u32>(static_cast<s32>(rm_val) >> (shift_imm ? shift_imm : 32));
-        case 3: return (rm_val >> shift_imm) | (rm_val << (32 - shift_imm));
+        case 3:
+            if (shift_imm == 0) {
+                const u32 carry = (cpu.state().cpsr & CpsrFlags::C) ? 1u : 0u;
+                return (carry << 31) | (rm_val >> 1);
+            }
+            return (rm_val >> shift_imm) | (rm_val << (32 - shift_imm));
         default: return rm_val;
     }
 }
@@ -380,7 +386,11 @@ bool ArmInterpreter::execute() {
                 s_mutex_wait_spin_count = 1;
             }
             if (s_mutex_wait_spin_count == 4096u && memory_.isMapped(addr, 4u)) {
-                Logger::log("CPU: patching mutex wait word at 0x%08X after spin loop at PC=0x%08X\n", addr, pc);
+                static bool s_logged_once = false;
+                if (!s_logged_once) {
+                    s_logged_once = true;
+                    Logger::log("CPU: patching mutex wait word at 0x%08X after spin loop at PC=0x%08X\n", addr, pc);
+                }
                 memory_.write32(addr, 0xFFFFFFFFu);
             }
         } else {
@@ -395,7 +405,7 @@ bool ArmInterpreter::execute() {
         const u16 inst16 = memory_.read16(pc);
 
         // Thumb-2 32-bit BL (immediate): first halfword 11110 S imm10, second halfword 11111 J1 J2 imm11.
-        // We only implement BL here (not BLX), enough to get through common veneers.
+        // Also handle BLX (immediate), which switches to ARM state.
         if ((inst16 & 0xF800u) == 0xF000u) {
             const u16 inst16b = memory_.read16(pc + 2u);
             if ((inst16b & 0xF800u) == 0xF800u) {
@@ -412,6 +422,23 @@ bool ArmInterpreter::execute() {
                 const u32 next = pc + 4u;
                 state_.r[14] = next | 1u;
                 state_.r[15] = (next + off) & ~1u;
+                return true;
+            }
+            if ((inst16b & 0xF800u) == 0xE800u) {
+                // BLX (immediate): imm = S:I1:I2:imm10:imm10H:00
+                const u32 s = (inst16 >> 10) & 1u;
+                const u32 imm10 = inst16 & 0x03FFu;
+                const u32 j1 = (inst16b >> 13) & 1u;
+                const u32 j2 = (inst16b >> 11) & 1u;
+                const u32 imm10h = (inst16b >> 1) & 0x03FFu;
+                const u32 i1 = (~(j1 ^ s)) & 1u;
+                const u32 i2 = (~(j2 ^ s)) & 1u;
+                u32 off = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm10h << 2);
+                if (s) off |= 0xFF000000u;
+                const u32 next = pc + 4u;
+                state_.r[14] = next | 1u;
+                state_.cpsr &= ~CPSR_T;
+                state_.r[15] = (next + off) & ~3u;
                 return true;
             }
         }
@@ -695,9 +722,44 @@ bool ArmInterpreter::execute() {
             return true;
         }
 
+        // LDR/STR (immediate, Thumb-1): 011x / 1000 groups.
+        // 0110: STR/LDR (word, imm5<<2), 0111: STRB/LDRB (byte, imm5)
+        // 1000: STRH/LDRH (halfword, imm5<<1)
+        if ((inst16 & 0xE000u) == 0x6000u) {
+            const u32 op = (inst16 >> 11) & 0x3u; // 00 STR, 01 LDR, 10 STRB, 11 LDRB
+            const u32 imm5 = (inst16 >> 6) & 0x1Fu;
+            const u32 rn = (inst16 >> 3) & 0x7u;
+            const u32 rt = inst16 & 0x7u;
+            const u32 base = state_.r[rn];
+            const u32 offset = (op < 2u) ? (imm5 << 2) : imm5;
+            const u32 addr = base + offset;
+            if (op == 0) {
+                memory_.write32(addr, state_.r[rt]);
+            } else if (op == 1) {
+                state_.r[rt] = memory_.read32(addr);
+            } else if (op == 2) {
+                memory_.write8(addr, static_cast<u8>(state_.r[rt] & 0xFFu));
+            } else {
+                state_.r[rt] = memory_.read8(addr);
+            }
+            state_.r[15] = pc + 2u;
+            return true;
+        }
+        if ((inst16 & 0xF000u) == 0x8000u) {
+            const bool load = (inst16 & 0x0800u) != 0;
+            const u32 imm5 = (inst16 >> 6) & 0x1Fu;
+            const u32 rn = (inst16 >> 3) & 0x7u;
+            const u32 rt = inst16 & 0x7u;
+            const u32 addr = state_.r[rn] + (imm5 << 1);
+            if (load) state_.r[rt] = memory_.read16(addr);
+            else memory_.write16(addr, static_cast<u16>(state_.r[rt] & 0xFFFFu));
+            state_.r[15] = pc + 2u;
+            return true;
+        }
+
         // BX/BLX (register): 010001 11 H:Rm 000
         // Encoding for BX Rm is 0x4700 | (Rm << 3). BLX is 0x4780 | (Rm << 3).
-        if ((inst16 & 0xFF87u) == 0x4700u) {
+        if ((inst16 & 0xFF00u) == 0x4700u) {
             const bool is_blx = (inst16 & 0x0080u) != 0;
             const u32 rm = (inst16 >> 3) & 0xFu;
             const u32 target = state_.r[rm];
@@ -823,6 +885,25 @@ bool ArmInterpreter::execute() {
             return true;
         }
 
+        // SVC (Thumb): 1101 1111 imm8
+        if ((inst16 & 0xFF00u) == 0xDF00u) {
+            const u32 svc_num = inst16 & 0xFFu;
+            const u32 saved_pc = pc + 2u;
+            const u32 saved_lr = state_.r[14];
+            if (svc_handler_) {
+                const bool cont = svc_handler_(svc_num);
+                if (!cont) {
+                    state_.r[15] = pc;
+                    return false;
+                }
+            } else {
+                Logger::log("SVC 0x%02X (thumb) called but no handler\n", svc_num);
+            }
+            state_.r[15] = saved_pc;
+            state_.r[14] = saved_lr;
+            return true;
+        }
+
 thumb_unknown:
         Logger::log("THUMB: unknown opcode 0x%04X at PC 0x%08X\n", inst16, pc);
         return false;
@@ -940,6 +1021,14 @@ thumb_unknown:
         if (is_bl)
             writeReg(14, state_.r[15] + 4);
         state_.r[15] = target;
+        return true;
+    }
+
+    // VMRS APSR_nzcv, FPSCR appears very early in userland startup.
+    // Handle it before generic decoder paths to avoid misclassification.
+    if ((inst & 0x0FFFFFF0u) == 0x0EF1FA10u) {
+        state_.cpsr = (state_.cpsr & 0x0FFFFFFFu) | (state_.fpscr & 0xF0000000u);
+        advancePC();
         return true;
     }
 
@@ -1181,18 +1270,64 @@ thumb_unknown:
         return true;
     }
 
-    if (bits27_25 == 7 && ((inst >> 20) & 0xF) == 0xF) {
-        u32 svc_num = imm24(inst);
-        advancePC();
-        const u32 saved_pc = state_.r[15];
-        const u32 saved_lr = state_.r[14];
-        if (svc_handler_) {
-            const bool cont = svc_handler_(svc_num);
-            state_.r[15] = saved_pc;
-            state_.r[14] = saved_lr;
-            return cont;
+    // Minimal VFP (CP10) support needed by early userland startup:
+    // - VLDR/VSTR (single)
+    // - VCMP.F32
+    // - VMRS APSR_nzcv, FPSCR
+    if (bits27_25 == 6 || bits27_25 == 7) {
+        // VLDR/VSTR (single): cond 110D U D 01 Rn Vd 1010 imm8
+        // Addressing is +/- (imm8 << 2) from Rn (or PC+8 for literal loads).
+        if ((inst & 0x0F300F00u) == 0x0D100A00u) {
+            const bool load = (inst & (1u << 20)) != 0;
+            const bool add = (inst & (1u << 23)) != 0;
+            const u32 d = (inst >> 22) & 1u;
+            const u32 vd = (inst >> 12) & 0xFu;
+            const u32 sreg = (vd << 1) | d;
+            const u32 rn = Rn(inst);
+            const u32 base = (rn == 15u) ? ((state_.r[15] + 8u) & ~3u) : state_.r[rn];
+            const u32 offset = (inst & 0xFFu) << 2;
+            const u32 addr = add ? (base + offset) : (base - offset);
+            if (load) state_.s[sreg] = memory_.read32(addr);
+            else memory_.write32(addr, state_.s[sreg]);
+            advancePC();
+            return true;
         }
-        return true;
+
+        // VCMP.F32 Sd, Sm
+        if ((inst & 0x0FBF0FD0u) == 0x0EB40A40u) {
+            const u32 d = (inst >> 22) & 1u;
+            const u32 vd = (inst >> 12) & 0xFu;
+            const u32 m = (inst >> 5) & 1u;
+            const u32 vm = inst & 0xFu;
+            const u32 sd = (vd << 1) | d;
+            const u32 sm = (vm << 1) | m;
+
+            float a = 0.0f, b = 0.0f;
+            std::memcpy(&a, &state_.s[sd], sizeof(float));
+            std::memcpy(&b, &state_.s[sm], sizeof(float));
+
+            u32 nzcv = 0;
+            if (std::isnan(a) || std::isnan(b)) {
+                // Unordered: C=1, V=1
+                nzcv = CpsrFlags::C | CpsrFlags::V;
+            } else if (a == b) {
+                nzcv = CpsrFlags::Z | CpsrFlags::C;
+            } else if (a < b) {
+                nzcv = CpsrFlags::N;
+            } else {
+                nzcv = CpsrFlags::C;
+            }
+            state_.fpscr = (state_.fpscr & 0x0FFFFFFFu) | nzcv;
+            advancePC();
+            return true;
+        }
+
+        // VMRS APSR_nzcv, FPSCR
+        if ((inst & 0x0FFFFFF0u) == 0x0EF1FA10u) {
+            state_.cpsr = (state_.cpsr & 0x0FFFFFFFu) | (state_.fpscr & 0xF0000000u);
+            advancePC();
+            return true;
+        }
     }
 
     if (bits27_25 == 0 || bits27_25 == 1) {
@@ -1220,19 +1355,77 @@ thumb_unknown:
             // Enable with NEDOB_SKIP_UNMAPPED_CALLS=1.
             static bool s_skip_unmapped_calls_inited = false;
             static bool s_skip_unmapped_calls = false;
+            static bool s_skip_nonexec_calls = false;
             if (!s_skip_unmapped_calls_inited) {
                 s_skip_unmapped_calls_inited = true;
                 if (const char* v = std::getenv("NEDOB_SKIP_UNMAPPED_CALLS"); v && v[0] == '1') {
                     s_skip_unmapped_calls = true;
+                }
+                if (const char* v = std::getenv("NEDOB_SKIP_NONEXEC_CALLS"); v && v[0] == '1') {
+                    s_skip_nonexec_calls = true;
                 }
             }
 
             const u32 target_addr = target & ~1u;
             const bool target_thumb = (target & 1u) != 0;
             const u32 target_fetch = target_thumb ? 2u : 4u;
+            // Optional bringup quirk: this callback table entry points one word before
+            // a real ARM routine in some traces.
+            // NEDOB_PATCH_BLX_2E7310_REDIRECT: skip worker call, simulate immediate success.
+            // 2=redirect into worker at +4; 1=skip entirely, return to caller with R0=1.
+            if (target_addr == 0x002E7310u && state_.r[15] == 0x00104578u) {
+                const char* v = std::getenv("NEDOB_PATCH_BLX_2E7310_REDIRECT");
+                if (v && v[0] == '2') {
+                    state_.r[14] = 0x0010457Cu;
+                    state_.r[15] = 0x002E7314u;
+                    state_.cpsr &= ~CPSR_T;
+                    return true;
+                }
+                if (v && v[0] == '1') {
+                    state_.r[0] = 1u;
+                    state_.r[15] = 0x0010457Cu;
+                    state_.cpsr &= ~CPSR_T;
+                    return true;
+                }
+            }
+            const auto is_known_null_callback_site = [this]() {
+                const u32 pc = state_.r[15];
+                return pc == 0x00108918u || pc == 0x00108944u || pc == 0x00108960u ||
+                       pc == 0x00108988u || pc == 0x001089A0u ||
+                       pc == 0x00105440u || pc == 0x00105454u;
+            };
             if (s_skip_unmapped_calls && is_blx && !memory_.isMapped(target_addr, target_fetch)) {
                 Logger::log("CPU: skipping unmapped BLX target=0x%08X from PC=0x%08X (LR=0x%08X)\n",
                             target_addr, state_.r[15], state_.r[14]);
+                // For known Pokemon Sun callback sites, a null function pointer should behave like
+                // a failed callback (non-zero), not success. This avoids falling into bad epilogues.
+                if ((target_addr == 0u && is_known_null_callback_site()) ||
+                    (target_addr == 0x005F7938u && state_.r[15] == 0x00105440u)) {
+                    state_.r[0] = 1u;
+                } else if (target_addr == 0u && state_.r[15] == 0x0010887Cu) {
+                    state_.r[0] = 0u;
+                } else if (target_addr == 0u &&
+                           (state_.r[15] == 0x00104540u || state_.r[15] == 0x00104550u)) {
+                    state_.r[0] = 0u;
+                }
+                const u32 ret = state_.r[14];
+                if ((ret & 1u) != 0) state_.cpsr |= CPSR_T;
+                else state_.cpsr &= ~CPSR_T;
+                state_.r[15] = ret & ~1u;
+                return true;
+            }
+            if (s_skip_nonexec_calls && is_blx && !memory_.isExecutable(target_addr, target_fetch)) {
+                Logger::log("CPU: skipping non-exec BLX target=0x%08X from PC=0x%08X (LR=0x%08X)\n",
+                            target_addr, state_.r[15], state_.r[14]);
+                if ((target_addr == 0u && is_known_null_callback_site()) ||
+                    (target_addr == 0x005F7938u && state_.r[15] == 0x00105440u)) {
+                    state_.r[0] = 1u;
+                } else if (target_addr == 0u && state_.r[15] == 0x0010887Cu) {
+                    state_.r[0] = 0u;
+                } else if (target_addr == 0u &&
+                           (state_.r[15] == 0x00104540u || state_.r[15] == 0x00104550u)) {
+                    state_.r[0] = 0u;
+                }
                 const u32 ret = state_.r[14];
                 if ((ret & 1u) != 0) state_.cpsr |= CPSR_T;
                 else state_.cpsr &= ~CPSR_T;
@@ -1448,6 +1641,11 @@ thumb_unknown:
                 case 0xE: result = rn_val & ~op2_val; break;
                 case 0xF: result = ~op2_val; break;
                 default: break;
+            }
+            if (op1 == 0xA && state_.r[15] == 0x00104564u && rn == 0u && op2_val == 0u && state_.r[0] == 0u) {
+                if (const char* v = std::getenv("NEDOB_PATCH_WORKER_READY_CHECK"); v && v[0] == '1') {
+                    result = 1u;
+                }
             }
             const bool compare_only_imm = (op1 == 0x8 || op1 == 0x9 || op1 == 0xA || op1 == 0xB);
             if (rd != 15 && !compare_only_imm)

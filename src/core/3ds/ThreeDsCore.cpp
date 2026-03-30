@@ -37,8 +37,55 @@ bool ThreeDS::loadROM(const std::string& path) {
     } else {
         memory_->mapCode(load_result.text_address, load_result.code.data(), load_result.code.size());
     }
+    // Mark only the text region executable. This prevents accidental BLX/BX into ro/data blobs.
+    if (load_result.text_size > 0) {
+        memory_->registerExecutableRange(load_result.text_address, load_result.text_size);
+    } else if (!load_result.code.empty()) {
+        memory_->registerExecutableRange(load_result.text_address, load_result.code.size());
+    }
     memory_->initProcessEnvironmentBlock(load_result.program_id);
     memory_->write32(4, 0xE12FFF1Eu);  // Boot vector at 0x4: BX LR (dead end if PC lands here)
+
+    // Bringup helper for Pokemon Sun worker loop:
+    // At 0x002E7608 the routine returns 0 and main-thread code spins forever waiting for
+    // progress that would normally come from full scheduler/thread semantics.
+    // Force a non-zero return to move execution into the next startup stage.
+    if (const char* v = std::getenv("NEDOB_PATCH_WORKER_RET1"); v && v[0] == '1') {
+        const u32 at = 0x002E7608u;
+        const u32 old = memory_->read32(at);
+        if (old == 0xE3A00000u) { // MOV R0, #0
+            memory_->write32(at, 0xE3A00001u); // MOV R0, #1
+            Logger::log("Worker patch: wrote 0xE3A00001 @0x%08X\n", at);
+        }
+    }
+    if (const char* v = std::getenv("NEDOB_PATCH_WORKER_LOOP_BNE"); v && v[0] == '1') {
+        const u32 at = 0x002E7604u;
+        const u32 old = memory_->read32(at);
+        if (old == 0x1AFFFFF5u) { // BNE 0x002E75E0
+            memory_->write32(at, 0xE1A00000u); // NOP
+            Logger::log("Worker patch: wrote NOP @0x%08X\n", at);
+        }
+    }
+    // Main thread loop at 0x00104560: BL check -> CMP R0,#0 -> BNE exit. If check returns 0, we
+    // loop forever. Patch BNE to B so we always exit after first check.
+    if (const char* v = std::getenv("NEDOB_PATCH_MAIN_LOOP_EXIT"); v && v[0] == '1') {
+        const u32 at = 0x00104568u;
+        const u32 old = memory_->read32(at);
+        if (old == 0x1B000076u) {  // BNE +0x76*4 (exit loop)
+            memory_->write32(at, 0xEA000076u);  // B +0x76*4 (always exit)
+            Logger::log("Main loop patch: wrote B @0x%08X\n", at);
+        }
+    }
+    // At 0x00104854: SUBS R0,... / 0x00104858: BPL +20. If BPL not taken we go to panic.
+    // Patch BPL to B so we always skip the panic and continue at 0x00104874.
+    if (const char* v = std::getenv("NEDOB_PATCH_TIMING_CHECK"); v && v[0] == '1') {
+        const u32 at = 0x00104858u;
+        const u32 old = memory_->read32(at);
+        if (old == 0x5A000005u) {  // BPL +5*4
+            memory_->write32(at, 0xEA000005u);  // B +5*4 (always skip panic)
+            Logger::log("Timing check patch: wrote B @0x%08X\n", at);
+        }
+    }
 
     // Dev helper: dump a few words from mapped memory to quickly sanity-check
     // code/rodata placement without editing code.
@@ -110,6 +157,14 @@ void ThreeDS::runFrame() {
     }
     memory_->resetUnmappedLogCount();
     memory_->advanceSharedPageTick();
+    if (svc_dispatcher_) {
+        u32 max_bootstraps = 1;
+        if (const char* v = std::getenv("NEDOB_BOOTSTRAP_THREADS_PER_FRAME"); v && v[0] != '\0') {
+            max_bootstraps = static_cast<u32>(std::strtoul(v, nullptr, 0));
+            if (max_bootstraps == 0) max_bootstraps = 1;
+        }
+        svc_dispatcher_->runPendingThreadBootstraps(*interpreter_, max_bootstraps);
+    }
 
     if (frame_count_ % 30 == 0 && frame_count_ > 0) {
         const u32 pc = interpreter_->getPC();

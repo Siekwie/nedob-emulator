@@ -21,6 +21,8 @@ constexpr u32 V = 1u << 28;
 struct ArmState {
     u32 r[16];   // R0-R15; r[15] is PC
     u32 cpsr{0}; // Current Program Status Register (N,Z,C,V in bits 31-28)
+    u32 fpscr{0}; // Floating-Point Status and Control Register (only NZCV is currently used)
+    u32 s[32]{};  // VFP single-precision registers S0..S31 (raw IEEE-754 bits)
 };
 
 /// ARM11 interpreter - fetch-decode-execute loop.

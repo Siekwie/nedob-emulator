@@ -37,16 +37,19 @@ bool GspHle::handleConnectToPort(ArmInterpreter& cpu) {
     if (std::strcmp(name, "gsp::Gpu") == 0) {
         cpu.state().r[1] = GSP_GPU_HANDLE;  // 3DS ABI: handle returned in R1
         cpu.state().r[0] = 0;  // success
+        if (out_handle_ptr != 0) memory_.write32(out_handle_ptr, cpu.state().r[1]);
         Logger::logInfo("GSP: ConnectToPort gsp::Gpu -> success (R1=0x%08X, out=0x%08X)\n",
                         cpu.state().r[1], out_handle_ptr);
     } else if (std::strcmp(name, "srv:") == 0 || name[0] == '\0' || std::strstr(name, "srv") != nullptr) {
         cpu.state().r[1] = SRV_HANDLE;  // returned in R1; caller stores it
         cpu.state().r[0] = 0;  // success (early boot: return srv: even if name hard to read)
+        if (out_handle_ptr != 0) memory_.write32(out_handle_ptr, cpu.state().r[1]);
         Logger::logInfo("GSP: ConnectToPort %s -> srv: success (R1=0x%08X, out=0x%08X)\n",
                         name[0] ? name : "(empty)", cpu.state().r[1], out_handle_ptr);
     } else {
         cpu.state().r[1] = SRV_HANDLE;  // default to srv handle for bringup
         cpu.state().r[0] = 0;  // success: always return valid handle so boot continues
+        if (out_handle_ptr != 0) memory_.write32(out_handle_ptr, cpu.state().r[1]);
         Logger::logInfo("GSP: ConnectToPort %s -> default srv: handle (R1=0x%08X, out=0x%08X)\n",
                         name, cpu.state().r[1], out_handle_ptr);
     }
@@ -71,6 +74,8 @@ u32 GspHle::getOrCreateServiceHandle(const std::string& name) {
 
 bool GspHle::handleSendSyncRequest(ArmInterpreter& cpu) {
     const u32 handle = cpu.state().r[0];
+    const u32 req_header_early = memory_.read32(CMD_BUF_TLS_VADDR + 0);
+    const u32 cmd_id_early = (req_header_early >> 16) & 0xFFFFu;
     constexpr int CMD_BUF_WORDS = 16;
     char buf[256];
     int len = std::snprintf(buf, sizeof(buf), "Service Request on Handle 0x%08X  CmdBuf[0..15]=", handle);
@@ -79,17 +84,29 @@ bool GspHle::handleSendSyncRequest(ArmInterpreter& cpu) {
         len += std::snprintf(buf + len, sizeof(buf) - static_cast<std::size_t>(len), " 0x%08X", w);
     }
     Logger::log("%s\n", buf);
-    if (handle == SRV_HANDLE) {
+    const bool is_srv_like_cmd = (cmd_id_early >= 0x1u && cmd_id_early <= 0xEu);
+    if (handle == SRV_HANDLE || is_srv_like_cmd) {
+        if (handle != SRV_HANDLE) {
+            // Some titles cache srv: as a dynamic session handle and reuse it.
+            service_by_handle_[handle] = "srv:";
+        }
         const u32 req_header = memory_.read32(CMD_BUF_TLS_VADDR + 0);
         const u32 cmd_id = (req_header >> 16) & 0xFFFFu;
         const u32 resp_header = (cmd_id << 16) | 0x40u;  // normal response shape
-        memory_.write32(CMD_BUF_TLS_VADDR + 0, resp_header);
-        memory_.write32(CMD_BUF_TLS_VADDR + 1 * 4, 0);  // ResultCode = 0 (success)
 
         // SRV basic commands needed by early runtime init.
         if (cmd_id == 0x1) {
-            // RegisterClient
-            Logger::logInfo("SRV: RegisterClient\n");
+            // RegisterClient - throttle log (very frequent during bootstrap)
+            static u32 rcc = 0;
+            if (rcc++ < 4) Logger::logInfo("SRV: RegisterClient\n");
+        } else if (cmd_id == 0x2) {
+            // EnableNotification: return notification semaphore handle in cmdbuf[3].
+            if (srv_notification_handle_ == 0) {
+                srv_notification_handle_ = getOrCreateServiceHandle("srv:notify");
+            }
+            memory_.write32(CMD_BUF_TLS_VADDR + 3 * 4, srv_notification_handle_);
+            static u32 enc = 0;
+            if (enc++ < 4) Logger::logInfo("SRV: EnableNotification -> semaphore=0x%08X\n", srv_notification_handle_);
         } else if (cmd_id == 0x5) {
             // GetServiceHandleDirect
             char name_buf[9]{};
@@ -108,31 +125,37 @@ bool GspHle::handleSendSyncRequest(ArmInterpreter& cpu) {
         } else {
             Logger::logInfo("SRV: unhandled cmd_id=0x%X (stub success)\n", cmd_id);
         }
+        memory_.write32(CMD_BUF_TLS_VADDR + 0, resp_header);
+        memory_.write32(CMD_BUF_TLS_VADDR + 1 * 4, 0);  // ResultCode = 0 (success)
 
         cpu.state().r[0] = 0;
         return true;
     }
-    if (handle == GSP_GPU_HANDLE || (service_by_handle_.count(handle) && service_by_handle_[handle] == "gsp::Gpu")) {
+    const auto it = service_by_handle_.find(handle);
+    if (handle == GSP_GPU_HANDLE || (it != service_by_handle_.end() && it->second == "gsp::Gpu")) {
         const u32 cmd = memory_.read32(CMD_BUF_TLS_VADDR + 0);
         static u32 log_count = 0;
         if (log_count++ < 50) {
             Logger::logInfo("GSP: SendSyncRequest cmd=0x%08X\n", cmd);
         }
-        processGspRequest(cpu);
+        processGspRequest(cpu, cmd);
         cpu.state().r[0] = 0;
         return true;
     }
 
     // Generic HLE response for unknown service handles (early bringup):
-    // return success so titles can continue probing services.
-    memory_.write32(CMD_BUF_TLS_VADDR + 0, IPC_HEADER_SUCCESS);
+    // return success with a response header that matches the request command id.
+    // Some clients validate this strictly and will retry forever if it doesn't match.
+    const u32 req_header = memory_.read32(CMD_BUF_TLS_VADDR + 0);
+    const u32 cmd_id = (req_header >> 16) & 0xFFFFu;
+    const u32 resp_header = (cmd_id << 16) | 0x40u;
+    memory_.write32(CMD_BUF_TLS_VADDR + 0, resp_header);
     memory_.write32(CMD_BUF_TLS_VADDR + 1 * 4, 0);
     cpu.state().r[0] = 0;
     return true;
 }
 
-void GspHle::processGspRequest(ArmInterpreter& cpu) {
-    const u32 cmd = cpu.state().r[1];
+void GspHle::processGspRequest(ArmInterpreter& cpu, u32 cmd) {
     switch (cmd) {
         case CMD_REGISTER_INTERRUPT_RELAY_QUEUE: {
             const u32 flags = cpu.state().r[2];
