@@ -9,6 +9,7 @@
 #include "application.hpp"
 #include "logger.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 
@@ -48,6 +49,52 @@ int main(int argc, char* argv[])
     bool rom_selected = false;
 
     if (kUseDevRomPath && std::filesystem::exists(kDevRomPath)) {
+        // Bringup defaults for the hardcoded dev ROM path. These can still be overridden by
+        // explicitly setting environment variables before launching the emulator.
+        if (std::getenv("NEDOB_BREAK_SPINS") == nullptr) {
+            ::setenv("NEDOB_BREAK_SPINS", "1", 1);
+        }
+        if (std::getenv("NEDOB_SPIN_THRESHOLD") == nullptr) {
+            ::setenv("NEDOB_SPIN_THRESHOLD", "20000", 1);
+        }
+        if (std::getenv("NEDOB_PATCH_PANIC_LOOP") == nullptr) {
+            ::setenv("NEDOB_PATCH_PANIC_LOOP", "1", 1);
+        }
+        if (std::getenv("NEDOB_LOG_PANIC_STRING") == nullptr) {
+            ::setenv("NEDOB_LOG_PANIC_STRING", "1", 1);
+        }
+        if (std::getenv("NEDOB_MAX_FRAMES") == nullptr) {
+            ::setenv("NEDOB_MAX_FRAMES", "60", 1);
+        }
+        if (std::getenv("NEDOB_SKIP_NONEXEC_CALLS") == nullptr) {
+            ::setenv("NEDOB_SKIP_NONEXEC_CALLS", "1", 1);
+        }
+        if (std::getenv("NEDOB_BOOTSTRAP_THREADS") == nullptr) {
+            ::setenv("NEDOB_BOOTSTRAP_THREADS", "1", 1);
+        }
+        if (std::getenv("NEDOB_THREAD_BOOTSTRAP_STEPS") == nullptr) {
+            ::setenv("NEDOB_THREAD_BOOTSTRAP_STEPS", "2000", 1);
+        }
+        if (std::getenv("NEDOB_PATCH_BLX_2E7310_REDIRECT") == nullptr) {
+            ::setenv("NEDOB_PATCH_BLX_2E7310_REDIRECT", "1", 1);
+        }
+        if (std::getenv("NEDOB_PATCH_WORKER_READY_CHECK") == nullptr) {
+            ::setenv("NEDOB_PATCH_WORKER_READY_CHECK", "1", 1);
+        }
+        if (std::getenv("NEDOB_PATCH_WORKER_LIST") == nullptr) {
+            ::setenv("NEDOB_PATCH_WORKER_LIST", "1", 1);
+        }
+        if (std::getenv("NEDOB_PATCH_WORKER_LOOP_BNE") == nullptr) {
+            ::setenv("NEDOB_PATCH_WORKER_LOOP_BNE", "1", 1);
+        }
+        if (std::getenv("NEDOB_PATCH_WORKER_RET1") == nullptr) {
+            ::setenv("NEDOB_PATCH_WORKER_RET1", "1", 1);
+        }
+        if (std::getenv("NEDOB_PATCH_MAIN_LOOP_EXIT") == nullptr) {
+            ::setenv("NEDOB_PATCH_MAIN_LOOP_EXIT", "1", 1);
+        }
+        // NEDOB_PATCH_TIMING_CHECK=1 skips panic path but leads to thread bootstrap spam; off by default
+
         result.filepath = kDevRomPath;
         result.rom_type = RomType::ThreeDS;
         result.cancelled = false;

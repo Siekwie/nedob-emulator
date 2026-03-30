@@ -2,6 +2,7 @@
 
 #include "../../common/common_types.hpp"
 #include <cstddef>
+#include <utility>
 #include <vector>
 
 /// Physical memory regions as seen from the ARM11
@@ -186,6 +187,13 @@ public:
     /// Convert virtual to physical address for GPU. Returns vaddr if no translation.
     VAddr virtualToPhysical(VAddr vaddr) const;
 
+    /// Helper for CPU fetch guards: returns true if the address range is backed by any region.
+    bool isMapped(VAddr addr, std::size_t size) const;
+    /// Register an executable virtual range (text/code). If no ranges are registered, execution checks allow all mapped addresses.
+    void registerExecutableRange(VAddr addr, std::size_t size);
+    /// Returns true when [addr, addr+size) lies inside any registered executable range.
+    bool isExecutable(VAddr addr, std::size_t size) const;
+
 private:
     bool tryFcram(VAddr addr, std::size_t size, std::size_t& out_offset) const;
     bool tryProcessMemory(VAddr addr, std::size_t size, std::size_t& out_offset) const;
@@ -195,7 +203,7 @@ private:
     bool trySharedPage(VAddr addr, std::size_t size, std::size_t& out_offset) const;
     bool tryTls(VAddr addr, std::size_t size, std::size_t& out_offset) const;
     bool tryStack(VAddr addr, std::size_t size, std::size_t& out_offset) const;
-    bool tryIo(VAddr addr) const;
+    bool tryIo(VAddr addr, std::size_t size) const;
     bool tryIoStub(VAddr addr, std::size_t size, std::size_t& out_offset) const;
 
     std::vector<u8> fcram_;
@@ -207,6 +215,7 @@ private:
     std::vector<u8> stack_mem_;
     std::vector<u8> tls_mem_;
     std::vector<u8> io_stub_;
+    std::vector<std::pair<VAddr, VAddr>> executable_ranges_;
     unsigned unmapped_log_count_{0};
     u32 current_access_pc_{0};
     bool has_current_access_pc_{false};
@@ -217,9 +226,22 @@ private:
     u64 unmapped_total_suppressed_{0};
     bool unmapped_suppress_notice_printed_{false};
 
+    // Optional debug escape hatch: break tight spin-wait loops that repeatedly read the
+    // same address waiting for it to become non-zero. Enable with `NEDOB_BREAK_SPINS=1`.
+    bool break_spins_enabled_{false};
+    u32 spin_threshold_{500000};
+    bool patch_panic_loop_{false};
+    bool patch_boot_assert_{false};
+    bool log_panic_string_{false};
+    bool panic_string_printed_{false};
+    VAddr spin_last_addr_{0};
+    u32 spin_last_pc_{0};
+    u32 spin_same_read_count_{0};
+    bool spin_notice_printed_{false};
+
     bool shouldLogUnmapped();
     void logUnmappedSuppressedOnce();
 
     static constexpr unsigned kMaxUnmappedLogPerFrame = 8;
-    static constexpr u64 kMaxUnmappedLogTotal = 2000;
+    static constexpr u64 kMaxUnmappedLogTotal = 256;
 };

@@ -1,0 +1,7 @@
+- Work with clarity, not by guessing.
+- If you encounter an unfamiliar topic, don't hesitate to search the web; usually it's already a solved problem.
+- Remember not to get stuck in loops of trying to solve one problem the same way over and over again.
+- When coding something to see if behavior changes and it does not, then the change probably wasn't what you thought and also won't help, so don't forget to delete non-working fixes; those clutter the codebase and lead to undefined behavior.
+- I know that when making complex projects it's easy to stub everything and continue from that point on. I have very bad experience with this; it leads to weird pitfalls because systems are half-implemented and otherwise not working, so please avoid using stubs. Just code it out. As in previous comments, nearly everything is a solved problem. Stubs only make it harder to debug at the end.
+- When needing to calculate values, do calculations, or other operations of sorts, we have the `/dev` directory where you store and make Python scripts that you can reuse.
+- Remember not to generate very large amounts of command output during tracing. Log to files and then grep those if needed, but don't overload every buffer in existence so even your harness crashes.

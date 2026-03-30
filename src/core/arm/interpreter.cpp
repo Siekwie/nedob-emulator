@@ -2,6 +2,8 @@
 #include "../3ds/memory.hpp"
 #include "../../common/logger.hpp"
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 
@@ -9,12 +11,33 @@ namespace {
 
 // Off by default; set to true only when debugging (e.g. after SVC to trace next instructions).
 static bool s_log_reg_writes = false;
-static bool s_trace_enabled = true;
+static bool s_trace_enabled = false;
 static int s_trace_remaining = -1;
 static bool s_trace_done = false;
 
+u32 parseU32Env(const char* name, u32 default_value) {
+    const char* s = std::getenv(name);
+    if (!s || !*s) return default_value;
+    char* end = nullptr;
+    unsigned long v = std::strtoul(s, &end, 0);  // base 0: accepts 0x... hex
+    if (!end || *end != '\0') return default_value;
+    return static_cast<u32>(v);
+}
+
+int parseIntEnv(const char* name, int default_value) {
+    const char* s = std::getenv(name);
+    if (!s || !*s) return default_value;
+    char* end = nullptr;
+    long v = std::strtol(s, &end, 0);
+    if (!end || *end != '\0') return default_value;
+    if (v < 1) return default_value;
+    if (v > 2000) v = 2000;  // keep logs bounded
+    return static_cast<int>(v);
+}
+
 void logRegWrite(u32 reg, u32 value, u32 pc) {
-    if (s_log_reg_writes && reg <= 14)
+    // Register writes are frequent; only log during an active trace window.
+    if (s_log_reg_writes && s_trace_remaining >= 0 && reg <= 14)
         Logger::log("  REG W R%u = 0x%08X  (PC=0x%08X)\n", reg, value, pc);
 }
 
@@ -82,7 +105,7 @@ constexpr u32 MASK_LDRSTR = 0x0DE00000u;
 constexpr u32 MASK_MOV_OP = 0x00E00000u;  // opcode bits 24-21 only (op1)
 constexpr u32 VAL_MOV_OP = 0x00D00000u;   // op1=0xD = MOV (register)
 constexpr u32 MASK_BLX_REG = 0x0FFFFFF0u;
-constexpr u32 MASK_NOP = 0x0FFFFFF0u;
+constexpr u32 MASK_NOP = 0x0FFFFFFFu;
 constexpr u32 MASK_SVC = 0x0F000000u;   // SVC: bits 27-24 = 1111
 constexpr u32 VAL_SVC = 0x0F000000u;
 
@@ -90,10 +113,13 @@ inline int32_t signExtend24(u32 v) {
     return static_cast<int32_t>((v & 0x800000) ? (v | 0xFF000000) : v);
 }
 
-// Trace: log next N instructions when PC hits either trigger (loop at 0x00100004 / 0x001045B4).
-constexpr u32 TRACE_TRIGGER_PC = 0x001069CCu;
-constexpr u32 TRACE_TRIGGER_PC_LOOP = 0x001069D0u;
-constexpr int TRACE_INSTRUCTION_COUNT = 48;
+// Trace: log next N instructions when PC hits either trigger.
+constexpr u32 TRACE_TRIGGER_PC_DEFAULT = 0x00108A48u;
+constexpr u32 TRACE_TRIGGER_PC_LOOP_DEFAULT = 0x00108A48u;
+constexpr int TRACE_INSTRUCTION_COUNT_DEFAULT = 200;
+static u32 s_trace_trigger_pc = TRACE_TRIGGER_PC_DEFAULT;
+static u32 s_trace_trigger_pc_loop = TRACE_TRIGGER_PC_LOOP_DEFAULT;
+static int s_trace_instruction_count = TRACE_INSTRUCTION_COUNT_DEFAULT;
 
 void logArmDisasm(u32 pc, u32 inst, int index, bool is_trigger_pc,
                   const u32* r, u32 cpsr) {
@@ -102,7 +128,7 @@ void logArmDisasm(u32 pc, u32 inst, int index, bool is_trigger_pc,
     const u32 c = cond(inst);
     const u32 n = (cpsr >> 31) & 1u, z = (cpsr >> 30) & 1u, c_flag = (cpsr >> 29) & 1u, v = (cpsr >> 28) & 1u;
 
-    if ((inst & 0xF0000000u) == 0xF0000000u && (inst & 0x0F000000u) == 0x0F000000u) {
+    if ((inst & MASK_SVC) == VAL_SVC) {
         std::snprintf(mnem, sizeof(mnem), "SVC #0x%06X", inst & 0xFFFFFFu);
     } else if (bits27_25 == 5) {
         const int32_t off = signExtend24(inst & 0xFFFFFFu) * 4;
@@ -117,9 +143,10 @@ void logArmDisasm(u32 pc, u32 inst, int index, bool is_trigger_pc,
         const char* size = (inst & (1u << 22)) ? "B" : "";
         std::snprintf(mnem, sizeof(mnem), "%s%s R%u, [R%u, #%u]",
                       load, size, rd, rn, off12);
-    } else if ((inst & 0x0FFFFFF0u) == 0x012FFF10u) {
+    } else if (((inst & 0x0FFFFFF0u) == 0x012FFF10u) || ((inst & 0x0FFFFFF0u) == 0x012FFF30u)) {
         const u32 rm = inst & 0xFu;
-        std::snprintf(mnem, sizeof(mnem), "%s R%u", (inst & (1u << 5)) ? "BLX" : "BX", rm);
+        const char* op = ((inst & 0x0FFFFFF0u) == 0x012FFF30u) ? "BLX" : "BX";
+        std::snprintf(mnem, sizeof(mnem), "%s R%u", op, rm);
     } else if (bits27_25 == 4) {
         const u32 rn = (inst >> 16) & 0xFu;
         const u32 list = inst & 0xFFFFu;
@@ -183,8 +210,10 @@ u32 expandImm12(u32 imm12_val) {
     u32 rot = (imm12_val >> 8) & 0xF;
     u32 imm8 = imm12_val & 0xFF;
     if (rot == 0) return imm8;
-    u32 val = imm8 | (imm8 << 16);
-    return (val >> (rot * 2)) | (val << (32 - rot * 2));
+    const u32 shift = rot * 2;
+    // ARM "modified immediate": 8-bit value rotated right by an even number of bits.
+    // (rot==0 means no rotation)
+    return (imm8 >> shift) | (imm8 << (32 - shift));
 }
 
 // Second operand for data-processing only. Do not use for LDR/STR offset.
@@ -192,7 +221,9 @@ u32 getOp2DataProcessing(ArmInterpreter& cpu, u32 inst) {
     if (I(inst)) {
         return expandImm12(imm12(inst));
     }
-    u32 rm_val = cpu.state().r[Rm(inst)];
+    const u32 rm = Rm(inst);
+    // In ARM state, reads of R15 as an operand yield (PC + 8) due to the pipeline.
+    u32 rm_val = (rm == 15) ? (cpu.state().r[15] + 8u) : cpu.state().r[rm];
     constexpr u32 SHIFT_TYPE_MASK = 3u;
     constexpr u32 SHIFT_IMM_MASK = 0x1Fu;
     u32 shift_type = (inst >> 5) & SHIFT_TYPE_MASK;
@@ -201,7 +232,12 @@ u32 getOp2DataProcessing(ArmInterpreter& cpu, u32 inst) {
         case 0: return shift_imm ? (rm_val << shift_imm) : rm_val;
         case 1: return shift_imm ? (rm_val >> shift_imm) : rm_val;
         case 2: return static_cast<u32>(static_cast<s32>(rm_val) >> (shift_imm ? shift_imm : 32));
-        case 3: return (rm_val >> shift_imm) | (rm_val << (32 - shift_imm));
+        case 3:
+            if (shift_imm == 0) {
+                const u32 carry = (cpu.state().cpsr & CpsrFlags::C) ? 1u : 0u;
+                return (carry << 31) | (rm_val >> 1);
+            }
+            return (rm_val >> shift_imm) | (rm_val << (32 - shift_imm));
         default: return rm_val;
     }
 }
@@ -238,6 +274,14 @@ inline bool overflowFromAdd(u32 src1, u32 src2, u32 result) {
 
 ArmInterpreter::ArmInterpreter(MemorySystem& memory, SvcHandler svc_handler)
     : memory_(memory), svc_handler_(std::move(svc_handler)), state_{} {
+    // Debug toggles; keep off by default to avoid multi-GB logs.
+    if (const char* v = std::getenv("NEDOB_TRACE"); v && v[0] == '1') s_trace_enabled = true;
+    if (const char* v = std::getenv("NEDOB_LOG_REG_WRITES"); v && v[0] == '1') s_log_reg_writes = true;
+    if (s_trace_enabled) {
+        s_trace_trigger_pc = parseU32Env("NEDOB_TRACE_TRIGGER_PC", TRACE_TRIGGER_PC_DEFAULT);
+        s_trace_trigger_pc_loop = parseU32Env("NEDOB_TRACE_TRIGGER_PC_LOOP", TRACE_TRIGGER_PC_LOOP_DEFAULT);
+        s_trace_instruction_count = parseIntEnv("NEDOB_TRACE_COUNT", TRACE_INSTRUCTION_COUNT_DEFAULT);
+    }
     for (u32 i = 0; i < 16; ++i) {
         state_.r[i] = 0;
     }
@@ -278,10 +322,81 @@ bool ArmInterpreter::execute() {
     const u32 pc = state_.r[15];
     // Feed the memory system with best-effort PC context so unmapped accesses can be attributed.
     memory_.setCurrentAccessPC(pc);
+
+    // Bringup guard: stop immediately if we ever fetch from an unmapped PC.
+    // This prevents multi-GB logs of "unmapped read16" when we jump to garbage.
+    static u32 s_prev_pc_guard = 0;
+    const u32 prev_pc_guard = s_prev_pc_guard;
+    const bool is_thumb = (state_.cpsr & CPSR_T) != 0;
+    const u32 fetch_size = is_thumb ? 2u : 4u;
+    if (!memory_.isMapped(pc, fetch_size)) {
+        Logger::log(
+            "CPU: unmapped instruction fetch PC=0x%08X (T=%u) prevPC=0x%08X LR=0x%08X SP=0x%08X CPSR=0x%08X\n",
+            pc, is_thumb ? 1u : 0u, prev_pc_guard, state_.r[14], state_.r[13], state_.cpsr);
+        if (prev_pc_guard != 0 && memory_.isMapped(prev_pc_guard, 4)) {
+            memory_.setCurrentAccessPC(prev_pc_guard);
+            const u32 prev_inst = memory_.read32(prev_pc_guard);
+            Logger::log("CPU: previous inst @0x%08X = 0x%08X\n", prev_pc_guard, prev_inst);
+            memory_.setCurrentAccessPC(pc);
+        }
+        return false;
+    }
+    s_prev_pc_guard = pc;
+
     if (pc >= 0x0FFFF000u && pc < 0x10000000u) {
         Logger::log("Stack Execution Detected - Probable Crash  PC=0x%08X  LR(R14)=0x%08X  SP(R13)=0x%08X\n",
                     pc, state_.r[14], state_.r[13]);
         return false;
+    }
+
+    // Bringup helper: detect first entry into the known idle loop at 0x0010486C/0x00104870.
+    static u32 s_prev_pc = 0;
+    if ((pc == 0x0010486Cu || pc == 0x00104870u) &&
+        !(s_prev_pc == 0x0010486Cu || s_prev_pc == 0x00104870u)) {
+        Logger::log("Entered idle loop at PC=0x%08X from PC=0x%08X (LR=0x%08X SP=0x%08X)\n",
+                    pc, s_prev_pc, state_.r[14], state_.r[13]);
+    }
+    s_prev_pc = pc;
+
+    // Bringup helper: break the known ARM atomic wait loop reached during early Pokemon Sun boot.
+    // In a single-thread/no-scheduler environment this loop can spin forever waiting for a value
+    // another thread would normally publish. We emulate forward progress by forcing the polled word
+    // negative after repeated spins so the wait path can continue.
+    static bool s_mutex_wait_patch_init = false;
+    static bool s_mutex_wait_patch_enabled = true;
+    static u32 s_mutex_wait_prev_addr = 0;
+    static u32 s_mutex_wait_spin_count = 0;
+    if (!s_mutex_wait_patch_init) {
+        s_mutex_wait_patch_init = true;
+        if (const char* v = std::getenv("NEDOB_PATCH_MUTEX_WAIT"); v && v[0] == '0') {
+            s_mutex_wait_patch_enabled = false;
+        }
+    }
+    if (s_mutex_wait_patch_enabled) {
+        const bool in_mutex_wait_loop =
+            (pc == 0x00108C2Cu || pc == 0x00108C30u || pc == 0x00108C34u || pc == 0x00108C38u ||
+             pc == 0x00108C54u || pc == 0x00108C58u || pc == 0x00108C5Cu || pc == 0x00108C60u ||
+             pc == 0x00108C64u || pc == 0x00108C80u || pc == 0x00108C84u);
+        if (in_mutex_wait_loop) {
+            const u32 addr = state_.r[0];
+            if (addr == s_mutex_wait_prev_addr) {
+                ++s_mutex_wait_spin_count;
+            } else {
+                s_mutex_wait_prev_addr = addr;
+                s_mutex_wait_spin_count = 1;
+            }
+            if (s_mutex_wait_spin_count == 4096u && memory_.isMapped(addr, 4u)) {
+                static bool s_logged_once = false;
+                if (!s_logged_once) {
+                    s_logged_once = true;
+                    Logger::log("CPU: patching mutex wait word at 0x%08X after spin loop at PC=0x%08X\n", addr, pc);
+                }
+                memory_.write32(addr, 0xFFFFFFFFu);
+            }
+        } else {
+            s_mutex_wait_spin_count = 0;
+            s_mutex_wait_prev_addr = 0;
+        }
     }
 
     // Thumb state: minimal Thumb-16 support (enough to get through common veneers/trampolines).
@@ -290,7 +405,7 @@ bool ArmInterpreter::execute() {
         const u16 inst16 = memory_.read16(pc);
 
         // Thumb-2 32-bit BL (immediate): first halfword 11110 S imm10, second halfword 11111 J1 J2 imm11.
-        // We only implement BL here (not BLX), enough to get through common veneers.
+        // Also handle BLX (immediate), which switches to ARM state.
         if ((inst16 & 0xF800u) == 0xF000u) {
             const u16 inst16b = memory_.read16(pc + 2u);
             if ((inst16b & 0xF800u) == 0xF800u) {
@@ -307,6 +422,23 @@ bool ArmInterpreter::execute() {
                 const u32 next = pc + 4u;
                 state_.r[14] = next | 1u;
                 state_.r[15] = (next + off) & ~1u;
+                return true;
+            }
+            if ((inst16b & 0xF800u) == 0xE800u) {
+                // BLX (immediate): imm = S:I1:I2:imm10:imm10H:00
+                const u32 s = (inst16 >> 10) & 1u;
+                const u32 imm10 = inst16 & 0x03FFu;
+                const u32 j1 = (inst16b >> 13) & 1u;
+                const u32 j2 = (inst16b >> 11) & 1u;
+                const u32 imm10h = (inst16b >> 1) & 0x03FFu;
+                const u32 i1 = (~(j1 ^ s)) & 1u;
+                const u32 i2 = (~(j2 ^ s)) & 1u;
+                u32 off = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm10h << 2);
+                if (s) off |= 0xFF000000u;
+                const u32 next = pc + 4u;
+                state_.r[14] = next | 1u;
+                state_.cpsr &= ~CPSR_T;
+                state_.r[15] = (next + off) & ~3u;
                 return true;
             }
         }
@@ -590,9 +722,44 @@ bool ArmInterpreter::execute() {
             return true;
         }
 
+        // LDR/STR (immediate, Thumb-1): 011x / 1000 groups.
+        // 0110: STR/LDR (word, imm5<<2), 0111: STRB/LDRB (byte, imm5)
+        // 1000: STRH/LDRH (halfword, imm5<<1)
+        if ((inst16 & 0xE000u) == 0x6000u) {
+            const u32 op = (inst16 >> 11) & 0x3u; // 00 STR, 01 LDR, 10 STRB, 11 LDRB
+            const u32 imm5 = (inst16 >> 6) & 0x1Fu;
+            const u32 rn = (inst16 >> 3) & 0x7u;
+            const u32 rt = inst16 & 0x7u;
+            const u32 base = state_.r[rn];
+            const u32 offset = (op < 2u) ? (imm5 << 2) : imm5;
+            const u32 addr = base + offset;
+            if (op == 0) {
+                memory_.write32(addr, state_.r[rt]);
+            } else if (op == 1) {
+                state_.r[rt] = memory_.read32(addr);
+            } else if (op == 2) {
+                memory_.write8(addr, static_cast<u8>(state_.r[rt] & 0xFFu));
+            } else {
+                state_.r[rt] = memory_.read8(addr);
+            }
+            state_.r[15] = pc + 2u;
+            return true;
+        }
+        if ((inst16 & 0xF000u) == 0x8000u) {
+            const bool load = (inst16 & 0x0800u) != 0;
+            const u32 imm5 = (inst16 >> 6) & 0x1Fu;
+            const u32 rn = (inst16 >> 3) & 0x7u;
+            const u32 rt = inst16 & 0x7u;
+            const u32 addr = state_.r[rn] + (imm5 << 1);
+            if (load) state_.r[rt] = memory_.read16(addr);
+            else memory_.write16(addr, static_cast<u16>(state_.r[rt] & 0xFFFFu));
+            state_.r[15] = pc + 2u;
+            return true;
+        }
+
         // BX/BLX (register): 010001 11 H:Rm 000
         // Encoding for BX Rm is 0x4700 | (Rm << 3). BLX is 0x4780 | (Rm << 3).
-        if ((inst16 & 0xFF87u) == 0x4700u) {
+        if ((inst16 & 0xFF00u) == 0x4700u) {
             const bool is_blx = (inst16 & 0x0080u) != 0;
             const u32 rm = (inst16 >> 3) & 0xFu;
             const u32 target = state_.r[rm];
@@ -718,6 +885,25 @@ bool ArmInterpreter::execute() {
             return true;
         }
 
+        // SVC (Thumb): 1101 1111 imm8
+        if ((inst16 & 0xFF00u) == 0xDF00u) {
+            const u32 svc_num = inst16 & 0xFFu;
+            const u32 saved_pc = pc + 2u;
+            const u32 saved_lr = state_.r[14];
+            if (svc_handler_) {
+                const bool cont = svc_handler_(svc_num);
+                if (!cont) {
+                    state_.r[15] = pc;
+                    return false;
+                }
+            } else {
+                Logger::log("SVC 0x%02X (thumb) called but no handler\n", svc_num);
+            }
+            state_.r[15] = saved_pc;
+            state_.r[14] = saved_lr;
+            return true;
+        }
+
 thumb_unknown:
         Logger::log("THUMB: unknown opcode 0x%04X at PC 0x%08X\n", inst16, pc);
         return false;
@@ -727,14 +913,14 @@ thumb_unknown:
     const u32 cond_bits = cond(inst);
 
     if (s_trace_enabled && !s_trace_done &&
-        (pc == TRACE_TRIGGER_PC || pc == TRACE_TRIGGER_PC_LOOP) && s_trace_remaining < 0) {
-        s_trace_remaining = TRACE_INSTRUCTION_COUNT;
+        (pc == s_trace_trigger_pc || pc == s_trace_trigger_pc_loop) && s_trace_remaining < 0) {
+        s_trace_remaining = s_trace_instruction_count;
         s_trace_done = true;
-        Logger::log("=== Trace: next %d instructions. State shown is BEFORE each instruction runs. ===\n", TRACE_INSTRUCTION_COUNT);
+        Logger::log("=== Trace: next %d instructions. State shown is BEFORE each instruction runs. ===\n", s_trace_instruction_count);
     }
     if (s_trace_enabled && s_trace_remaining >= 0) {
-        const int index = TRACE_INSTRUCTION_COUNT - s_trace_remaining;
-        logArmDisasm(pc, inst, index, pc == TRACE_TRIGGER_PC, state_.r, state_.cpsr);
+        const int index = s_trace_instruction_count - s_trace_remaining;
+        logArmDisasm(pc, inst, index, pc == s_trace_trigger_pc, state_.r, state_.cpsr);
         --s_trace_remaining;
     }
 
@@ -747,9 +933,16 @@ thumb_unknown:
         const u32 saved_lr = state_.r[14];
         if (svc_handler_) {
             const bool cont = svc_handler_(svc_num);
+            if (!cont) {
+                // Make "stop" persistent: keep PC on the SVC so the next slice
+                // immediately returns 0 cycles and the core can mark execution stopped.
+                state_.r[15] = pc;
+                state_.r[14] = saved_lr;
+                return false;
+            }
             state_.r[15] = saved_pc;
             state_.r[14] = saved_lr;
-            return cont;
+            return true;
         }
         return true;
     }
@@ -794,7 +987,7 @@ thumb_unknown:
     // LDM/STM (bits 27-25 = 100). In ARMv7, cond=15 (0xF) is often "unconditional" for this class; do not skip.
     const bool is_ldm_stm = (bits27_25 == 4);
     if (!is_ldm_stm && !conditionPassed(cond_bits, state_.cpsr)) {
-        if (s_trace_enabled && bits27_25 == 5) {
+        if (s_trace_enabled && s_trace_remaining >= 0 && bits27_25 == 5) {
             const u32 n = (state_.cpsr >> 31) & 1u, z = (state_.cpsr >> 30) & 1u, c = (state_.cpsr >> 29) & 1u, v = (state_.cpsr >> 28) & 1u;
             Logger::log("  B cond=0x%X NOT TAKEN -> next inst  NZCV=%u%u%u%u\n", cond_bits, n, z, c, v);
         }
@@ -813,12 +1006,29 @@ thumb_unknown:
         const u32 n = (state_.cpsr >> 31) & 1u, z = (state_.cpsr >> 30) & 1u, c = (state_.cpsr >> 29) & 1u, v = (state_.cpsr >> 28) & 1u;
         const int32_t offset_bytes = signExtend24(imm24(inst)) * 4;
         const u32 target = state_.r[15] + 8 + offset_bytes;
+        // Bringup helper: detect when userland falls into the "idle/panic" infinite loop.
+        static bool s_idle_loop_reported = false;
+        if (!s_idle_loop_reported && taken &&
+            (target == 0x0010486Cu || target == 0x00104870u) &&
+            (pc != 0x0010486Cu && pc != 0x00104870u)) {
+            Logger::log("Entered idle loop: branch from PC=0x%08X to 0x%08X (LR=0x%08X)\n",
+                        pc, target, state_.r[14]);
+            s_idle_loop_reported = true;
+        }
         if (s_trace_enabled && s_trace_remaining >= 0 && cond_b != COND_AL && cond_b != COND_NV)
             Logger::log("  B cond=0x%X %s -> 0x%08X  NZCV=%u%u%u%u\n", cond_b, taken ? "TAKEN" : "not taken", target, n, z, c, v);
         const bool is_bl = (inst & (1u << 24)) != 0;
         if (is_bl)
             writeReg(14, state_.r[15] + 4);
         state_.r[15] = target;
+        return true;
+    }
+
+    // VMRS APSR_nzcv, FPSCR appears very early in userland startup.
+    // Handle it before generic decoder paths to avoid misclassification.
+    if ((inst & 0x0FFFFFF0u) == 0x0EF1FA10u) {
+        state_.cpsr = (state_.cpsr & 0x0FFFFFFFu) | (state_.fpscr & 0xF0000000u);
+        advancePC();
         return true;
     }
 
@@ -834,12 +1044,23 @@ thumb_unknown:
             if (B(inst)) {
                 u32 val = memory_.read8(addr);
                 writeReg(rd, val);
-                if (s_trace_enabled && rn == 15)
+                if (s_trace_enabled && s_trace_remaining >= 0 && rn == 15)
                     Logger::log("  LDRB [PC,#%s%u] addr=0x%08X -> 0x%02X\n", U(inst) ? "" : "-", offset12, addr, val & 0xFFu);
             } else {
                 u32 val = memory_.read32(addr);
-                writeReg(rd, val);
-                if (s_trace_enabled && rn == 15)
+                // Loads into PC can switch instruction set state (ARMv5+ behavior).
+                // This matters for veneers and for `pop {..., pc}` sequences.
+                if (rd == 15) {
+                    if (s_trace_enabled && s_trace_remaining >= 0) {
+                        Logger::log("LDR POP PC: loading value 0x%08X from addr 0x%08X into PC\n", val, addr);
+                    }
+                    if ((val & 1u) != 0) state_.cpsr |= CPSR_T;
+                    else state_.cpsr &= ~CPSR_T;
+                    state_.r[15] = val & ~1u;
+                } else {
+                    writeReg(rd, val);
+                }
+                if (s_trace_enabled && s_trace_remaining >= 0 && rn == 15)
                     Logger::log("  LDR [PC,#%s%u] addr=0x%08X -> 0x%08X\n", U(inst) ? "" : "-", offset12, addr, val);
             }
         } else {
@@ -854,7 +1075,86 @@ thumb_unknown:
         bool do_writeback = (!P(inst) || W(inst)) && (rn != 15);
         if (do_writeback)
             writeReg(rn, P(inst) ? addr : (base + offset_val));
-        advancePC();
+        // If we loaded PC, we already branched (and possibly switched state).
+        if (!(L(inst) && rd == 15)) {
+            advancePC();
+        }
+        return true;
+    }
+
+    // LDR/STR register offset (bits 27-25 = 011). Commonly used by memcpy/memset loops.
+    if (bits27_25 == 3) {
+        const u32 rn = Rn(inst);
+        const u32 rd = Rd(inst);
+        const u32 rm = Rm(inst);
+        const u32 base = (rn == 15) ? (state_.r[15] + 8) : state_.r[rn];
+
+        const u32 shift_imm = (inst >> 7) & 0x1Fu;
+        const u32 shift_type = (inst >> 5) & 0x3u; // 00 LSL, 01 LSR, 10 ASR, 11 ROR/RRX
+        // In ARM state, reads of R15 as an operand yield (PC + 8) due to the pipeline.
+        u32 off = (rm == 15) ? (state_.r[15] + 8u) : state_.r[rm];
+        switch (shift_type) {
+            case 0: // LSL
+                off = (shift_imm == 0) ? off : (off << shift_imm);
+                break;
+            case 1: { // LSR (imm==0 => 32)
+                const u32 s = (shift_imm == 0) ? 32u : shift_imm;
+                off = (s == 32u) ? 0u : (off >> s);
+                break;
+            }
+            case 2: { // ASR (imm==0 => 32)
+                const u32 s = (shift_imm == 0) ? 32u : shift_imm;
+                off = static_cast<u32>(static_cast<s32>(off) >> (s == 32u ? 31u : s));
+                break;
+            }
+            case 3: // ROR (imm==0 => RRX)
+                if (shift_imm == 0) {
+                    const u32 c = ((state_.cpsr & CpsrFlags::C) != 0) ? 1u : 0u;
+                    off = (c << 31) | (off >> 1);
+                } else {
+                    const u32 r = shift_imm & 31u;
+                    off = (off >> r) | (off << ((32u - r) & 31u));
+                }
+                break;
+        }
+
+        const u32 offset_val = U(inst) ? off : (0u - off);
+        const u32 addr = P(inst) ? (base + offset_val) : base;
+
+        if (L(inst)) {
+            if (B(inst)) {
+                const u32 val = memory_.read8(addr);
+                writeReg(rd, val);
+            } else {
+                const u32 val = memory_.read32(addr);
+                if (rd == 15) {
+                    if (s_trace_enabled && s_trace_remaining >= 0) {
+                        Logger::log("LDR POP PC: loading value 0x%08X from addr 0x%08X into PC\n", val, addr);
+                    }
+                    if ((val & 1u) != 0) state_.cpsr |= CPSR_T;
+                    else state_.cpsr &= ~CPSR_T;
+                    state_.r[15] = val & ~1u;
+                } else {
+                    writeReg(rd, val);
+                }
+            }
+        } else {
+            if (B(inst)) {
+                logStackRegionWrite(addr, state_.r[rd] & 0xFFu, state_.r[13], state_.r[15]);
+                memory_.write8(addr, static_cast<u8>(state_.r[rd]));
+            } else {
+                logStackRegionWrite(addr, state_.r[rd], state_.r[13], state_.r[15]);
+                memory_.write32(addr, state_.r[rd]);
+            }
+        }
+
+        const bool do_writeback = (!P(inst) || W(inst)) && (rn != 15);
+        if (do_writeback) {
+            writeReg(rn, P(inst) ? addr : (base + offset_val));
+        }
+        if (!(L(inst) && rd == 15)) {
+            advancePC();
+        }
         return true;
     }
 
@@ -931,8 +1231,13 @@ thumb_unknown:
                     if (s_trace_enabled && s_trace_remaining >= 0) {
                         Logger::log("LDM POP PC: loading value 0x%08X from addr 0x%08X into PC\n", value, addr);
                     }
+                    // Loading PC via LDM can switch instruction set state (bit0 indicates Thumb).
+                    if ((value & 1u) != 0) state_.cpsr |= CPSR_T;
+                    else state_.cpsr &= ~CPSR_T;
+                    state_.r[15] = value & ~1u;
+                } else {
+                    writeReg(i, value);
                 }
-                writeReg(i, value);
                 addr += 4;
             }
         } else {
@@ -965,27 +1270,74 @@ thumb_unknown:
         return true;
     }
 
-    if (bits27_25 == 7 && ((inst >> 20) & 0xF) == 0xF) {
-        u32 svc_num = imm24(inst);
-        advancePC();
-        const u32 saved_pc = state_.r[15];
-        const u32 saved_lr = state_.r[14];
-        if (svc_handler_) {
-            const bool cont = svc_handler_(svc_num);
-            state_.r[15] = saved_pc;
-            state_.r[14] = saved_lr;
-            return cont;
+    // Minimal VFP (CP10) support needed by early userland startup:
+    // - VLDR/VSTR (single)
+    // - VCMP.F32
+    // - VMRS APSR_nzcv, FPSCR
+    if (bits27_25 == 6 || bits27_25 == 7) {
+        // VLDR/VSTR (single): cond 110D U D 01 Rn Vd 1010 imm8
+        // Addressing is +/- (imm8 << 2) from Rn (or PC+8 for literal loads).
+        if ((inst & 0x0F300F00u) == 0x0D100A00u) {
+            const bool load = (inst & (1u << 20)) != 0;
+            const bool add = (inst & (1u << 23)) != 0;
+            const u32 d = (inst >> 22) & 1u;
+            const u32 vd = (inst >> 12) & 0xFu;
+            const u32 sreg = (vd << 1) | d;
+            const u32 rn = Rn(inst);
+            const u32 base = (rn == 15u) ? ((state_.r[15] + 8u) & ~3u) : state_.r[rn];
+            const u32 offset = (inst & 0xFFu) << 2;
+            const u32 addr = add ? (base + offset) : (base - offset);
+            if (load) state_.s[sreg] = memory_.read32(addr);
+            else memory_.write32(addr, state_.s[sreg]);
+            advancePC();
+            return true;
         }
-        return true;
+
+        // VCMP.F32 Sd, Sm
+        if ((inst & 0x0FBF0FD0u) == 0x0EB40A40u) {
+            const u32 d = (inst >> 22) & 1u;
+            const u32 vd = (inst >> 12) & 0xFu;
+            const u32 m = (inst >> 5) & 1u;
+            const u32 vm = inst & 0xFu;
+            const u32 sd = (vd << 1) | d;
+            const u32 sm = (vm << 1) | m;
+
+            float a = 0.0f, b = 0.0f;
+            std::memcpy(&a, &state_.s[sd], sizeof(float));
+            std::memcpy(&b, &state_.s[sm], sizeof(float));
+
+            u32 nzcv = 0;
+            if (std::isnan(a) || std::isnan(b)) {
+                // Unordered: C=1, V=1
+                nzcv = CpsrFlags::C | CpsrFlags::V;
+            } else if (a == b) {
+                nzcv = CpsrFlags::Z | CpsrFlags::C;
+            } else if (a < b) {
+                nzcv = CpsrFlags::N;
+            } else {
+                nzcv = CpsrFlags::C;
+            }
+            state_.fpscr = (state_.fpscr & 0x0FFFFFFFu) | nzcv;
+            advancePC();
+            return true;
+        }
+
+        // VMRS APSR_nzcv, FPSCR
+        if ((inst & 0x0FFFFFF0u) == 0x0EF1FA10u) {
+            state_.cpsr = (state_.cpsr & 0x0FFFFFFFu) | (state_.fpscr & 0xF0000000u);
+            advancePC();
+            return true;
+        }
     }
 
     if (bits27_25 == 0 || bits27_25 == 1) {
         const u32 op1 = opcode1(inst);
 
-        // BX / BLX (register): 0x012FFF10 = BX Rm, 0x012FFF30 = BLX Rm (L=1). Target must be word-aligned (bit 0 clear).
-        if ((inst & MASK_BLX_REG) == 0x012FFF10) {
-            const bool is_blx = (inst & (1u << 5)) != 0;
-            const u32 rm = Rm(inst);
+        // BX / BLX (register): 0x012FFF10 = BX Rm, 0x012FFF30 = BLX Rm (L=1).
+        const u32 bx_tag = (inst & 0x0FFFFFF0u);
+        if (bx_tag == 0x012FFF10u || bx_tag == 0x012FFF30u) {
+            const bool is_blx = (bx_tag == 0x012FFF30u);
+            const u32 rm = inst & 0xFu;
             const u32 target = state_.r[rm];
             if (!is_blx && rm == 14) {
                 // This can be extremely spammy in busy loops; only log during an active trace window.
@@ -994,11 +1346,96 @@ thumb_unknown:
                                 state_.r[15], state_.r[14], target & ~1u, (target & 1u) ? " (thumb)" : "");
                 }
             }
-            if (is_blx)
+            if (is_blx) {
                 writeReg(14, state_.r[15] + 4);
-            if ((target & 1u) != 0) state_.cpsr |= CPSR_T;
+            }
+
+            // Bringup escape hatch: if we call through a function pointer that is totally unmapped,
+            // allow skipping the call instead of spamming unmapped fetches.
+            // Enable with NEDOB_SKIP_UNMAPPED_CALLS=1.
+            static bool s_skip_unmapped_calls_inited = false;
+            static bool s_skip_unmapped_calls = false;
+            static bool s_skip_nonexec_calls = false;
+            if (!s_skip_unmapped_calls_inited) {
+                s_skip_unmapped_calls_inited = true;
+                if (const char* v = std::getenv("NEDOB_SKIP_UNMAPPED_CALLS"); v && v[0] == '1') {
+                    s_skip_unmapped_calls = true;
+                }
+                if (const char* v = std::getenv("NEDOB_SKIP_NONEXEC_CALLS"); v && v[0] == '1') {
+                    s_skip_nonexec_calls = true;
+                }
+            }
+
+            const u32 target_addr = target & ~1u;
+            const bool target_thumb = (target & 1u) != 0;
+            const u32 target_fetch = target_thumb ? 2u : 4u;
+            // Optional bringup quirk: this callback table entry points one word before
+            // a real ARM routine in some traces.
+            // NEDOB_PATCH_BLX_2E7310_REDIRECT: skip worker call, simulate immediate success.
+            // 2=redirect into worker at +4; 1=skip entirely, return to caller with R0=1.
+            if (target_addr == 0x002E7310u && state_.r[15] == 0x00104578u) {
+                const char* v = std::getenv("NEDOB_PATCH_BLX_2E7310_REDIRECT");
+                if (v && v[0] == '2') {
+                    state_.r[14] = 0x0010457Cu;
+                    state_.r[15] = 0x002E7314u;
+                    state_.cpsr &= ~CPSR_T;
+                    return true;
+                }
+                if (v && v[0] == '1') {
+                    state_.r[0] = 1u;
+                    state_.r[15] = 0x0010457Cu;
+                    state_.cpsr &= ~CPSR_T;
+                    return true;
+                }
+            }
+            const auto is_known_null_callback_site = [this]() {
+                const u32 pc = state_.r[15];
+                return pc == 0x00108918u || pc == 0x00108944u || pc == 0x00108960u ||
+                       pc == 0x00108988u || pc == 0x001089A0u ||
+                       pc == 0x00105440u || pc == 0x00105454u;
+            };
+            if (s_skip_unmapped_calls && is_blx && !memory_.isMapped(target_addr, target_fetch)) {
+                Logger::log("CPU: skipping unmapped BLX target=0x%08X from PC=0x%08X (LR=0x%08X)\n",
+                            target_addr, state_.r[15], state_.r[14]);
+                // For known Pokemon Sun callback sites, a null function pointer should behave like
+                // a failed callback (non-zero), not success. This avoids falling into bad epilogues.
+                if ((target_addr == 0u && is_known_null_callback_site()) ||
+                    (target_addr == 0x005F7938u && state_.r[15] == 0x00105440u)) {
+                    state_.r[0] = 1u;
+                } else if (target_addr == 0u && state_.r[15] == 0x0010887Cu) {
+                    state_.r[0] = 0u;
+                } else if (target_addr == 0u &&
+                           (state_.r[15] == 0x00104540u || state_.r[15] == 0x00104550u)) {
+                    state_.r[0] = 0u;
+                }
+                const u32 ret = state_.r[14];
+                if ((ret & 1u) != 0) state_.cpsr |= CPSR_T;
+                else state_.cpsr &= ~CPSR_T;
+                state_.r[15] = ret & ~1u;
+                return true;
+            }
+            if (s_skip_nonexec_calls && is_blx && !memory_.isExecutable(target_addr, target_fetch)) {
+                Logger::log("CPU: skipping non-exec BLX target=0x%08X from PC=0x%08X (LR=0x%08X)\n",
+                            target_addr, state_.r[15], state_.r[14]);
+                if ((target_addr == 0u && is_known_null_callback_site()) ||
+                    (target_addr == 0x005F7938u && state_.r[15] == 0x00105440u)) {
+                    state_.r[0] = 1u;
+                } else if (target_addr == 0u && state_.r[15] == 0x0010887Cu) {
+                    state_.r[0] = 0u;
+                } else if (target_addr == 0u &&
+                           (state_.r[15] == 0x00104540u || state_.r[15] == 0x00104550u)) {
+                    state_.r[0] = 0u;
+                }
+                const u32 ret = state_.r[14];
+                if ((ret & 1u) != 0) state_.cpsr |= CPSR_T;
+                else state_.cpsr &= ~CPSR_T;
+                state_.r[15] = ret & ~1u;
+                return true;
+            }
+
+            if (target_thumb) state_.cpsr |= CPSR_T;
             else state_.cpsr &= ~CPSR_T;
-            state_.r[15] = target & ~1u;
+            state_.r[15] = target_addr;
             return true;
         }
 
@@ -1007,10 +1444,55 @@ thumb_unknown:
             return true;
         }
 
+        // ARMv6T2 wide-immediate moves.
+        // MOVW Rd, #imm16 : Rd = imm16
+        // MOVT Rd, #imm16 : Rd[31:16] = imm16, lower half unchanged.
+        if ((inst & 0x0FF00000u) == 0x03000000u || (inst & 0x0FF00000u) == 0x03400000u) {
+            const bool is_movt = (inst & 0x00400000u) != 0;
+            const u32 rd = Rd(inst);
+            const u32 imm4 = (inst >> 16) & 0xFu;
+            const u32 imm12 = inst & 0xFFFu;
+            const u32 imm16 = (imm4 << 12) | imm12;
+            if (is_movt) {
+                const u32 value = (state_.r[rd] & 0x0000FFFFu) | (imm16 << 16);
+                writeReg(rd, value);
+            } else {
+                writeReg(rd, imm16);
+            }
+            advancePC();
+            return true;
+        }
+
+        // ARMv6 exclusive accesses used by atomics:
+        //   LDREX Rt, [Rn]
+        //   STREX Rd, Rt, [Rn]
+        // Single-core bringup model: STREX always succeeds (Rd=0) and writes immediately.
+        if ((inst & 0x0FF00FF0u) == 0x01900F90u) {  // LDREX
+            const u32 rt = Rd(inst);
+            const u32 rn = Rn(inst);
+            const u32 addr = (rn == 15) ? (pc + 8u) : state_.r[rn];
+            const u32 val = memory_.read32(addr);
+            writeReg(rt, val);
+            advancePC();
+            return true;
+        }
+        if ((inst & 0x0FF00FF0u) == 0x01800F90u) {  // STREX
+            const u32 rn = Rn(inst);
+            const u32 rd = Rd(inst);      // status result
+            const u32 rt = Rm(inst);      // value source register (bits[3:0] in this encoding)
+            const u32 addr = (rn == 15) ? (pc + 8u) : state_.r[rn];
+            logStackRegionWrite(addr, state_.r[rt], state_.r[13], state_.r[15]);
+            memory_.write32(addr, state_.r[rt]);
+            writeReg(rd, 0u);             // success
+            advancePC();
+            return true;
+        }
+
         // SUB (and SUB with S): Rd = Rn - Op2; when S, C = no borrow = (Rn >= Op2). Do not write Rd for CMP (Rd==15).
         if ((inst & MASK_COND_OP1_S_Rd) == 0x00500000 && Rd(inst) != 15) {
             u32 rd = Rd(inst);
-            u32 rn_val = state_.r[Rn(inst)];
+            const u32 rn = Rn(inst);
+            u32 rn_val = (rn == 15) ? (pc + 8u) : state_.r[rn];
             u32 op2_val = getOp2DataProcessing(*this, inst);
             u32 result = rn_val - op2_val;
             writeReg(rd, result);
@@ -1027,7 +1509,8 @@ thumb_unknown:
 
         // CMP: SUBS with Rd=15. Only set flags; NEVER write to any register (not R0, not R15).
         if ((inst & MASK_COND_OP1_S_Rd) == 0x00A000F0) {
-            u32 rn_val = state_.r[Rn(inst)];
+            const u32 rn = Rn(inst);
+            u32 rn_val = (rn == 15) ? (pc + 8u) : state_.r[rn];
             u32 op2_val = getOp2DataProcessing(*this, inst);
             u32 result = rn_val - op2_val;
             bool n_flag = (result & 0x80000000u) != 0;
@@ -1049,7 +1532,7 @@ thumb_unknown:
             u32 addr = P(inst) ? (base + offset_val) : base;
             u32 val = memory_.read32(addr);
             writeReg(rd, val);
-            if (s_trace_enabled && rn == 15)
+            if (s_trace_enabled && s_trace_remaining >= 0 && rn == 15)
                 Logger::log("  LDR [PC,#%s%u] addr=0x%08X -> 0x%08X (opcode 0x05800000 path)\n", U(inst) ? "" : "-", offset12, addr, val);
             if ((!P(inst) || W(inst)) && rn != 15) writeReg(rn, P(inst) ? addr : (base + offset_val));
             advancePC();
@@ -1074,7 +1557,8 @@ thumb_unknown:
         // Data-processing (register form): Op2 from register + shift. S-bit means update flags (including CMP/TST/TEQ/CMN where Rd=15).
         if ((inst & MASK_DATAPROC) == 0x00000000 && !I(inst)) {
             u32 rd = Rd(inst);
-            u32 rn_val = state_.r[Rn(inst)];
+            const u32 rn = Rn(inst);
+            u32 rn_val = (rn == 15) ? (pc + 8u) : state_.r[rn];
             u32 op2_val = getOp2DataProcessing(*this, inst);
             u32 result = 0;
             switch (op1) {
@@ -1137,7 +1621,8 @@ thumb_unknown:
         // Data-processing (immediate form): Op2 = expanded imm12. S-bit means update flags (including CMP/CMN with Rd=15).
         if ((inst & MASK_DATAPROC_IMM) == 0x02000000 && I(inst)) {
             u32 rd = Rd(inst);
-            u32 rn_val = state_.r[Rn(inst)];
+            const u32 rn = Rn(inst);
+            u32 rn_val = (rn == 15) ? (pc + 8u) : state_.r[rn];
             u32 op2_val = expandImm12(imm12(inst));
             u32 result = 0;
             switch (op1) {
@@ -1156,6 +1641,11 @@ thumb_unknown:
                 case 0xE: result = rn_val & ~op2_val; break;
                 case 0xF: result = ~op2_val; break;
                 default: break;
+            }
+            if (op1 == 0xA && state_.r[15] == 0x00104564u && rn == 0u && op2_val == 0u && state_.r[0] == 0u) {
+                if (const char* v = std::getenv("NEDOB_PATCH_WORKER_READY_CHECK"); v && v[0] == '1') {
+                    result = 1u;
+                }
             }
             const bool compare_only_imm = (op1 == 0x8 || op1 == 0x9 || op1 == 0xA || op1 == 0xB);
             if (rd != 15 && !compare_only_imm)

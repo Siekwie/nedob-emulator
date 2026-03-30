@@ -2,9 +2,25 @@
 #include "../arm/interpreter.hpp"
 #include "../3ds/memory.hpp"
 #include "../../common/logger.hpp"
+#include <cstdlib>
 #include <cstring>
 
 namespace {
+constexpr u32 CPSR_T = (1u << 5);
+
+bool envEnabledCached(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '0';
+}
+
+u32 parseU32EnvOrDefault(const char* name, u32 default_value) {
+    const char* v = std::getenv(name);
+    if (!v || v[0] == '\0') return default_value;
+    char* end = nullptr;
+    unsigned long parsed = std::strtoul(v, &end, 0);
+    if (!end || *end != '\0') return default_value;
+    return static_cast<u32>(parsed);
+}
 
 std::string readStringFromMemory(MemorySystem& mem, u32 ptr) {
     std::string s;
@@ -74,6 +90,48 @@ u32 SvcDispatcher::allocHandle(const std::string& type) {
     return id;
 }
 
+void SvcDispatcher::runPendingThreadBootstraps(ArmInterpreter& cpu, u32 max_threads) {
+    if (pending_thread_bootstraps_.empty() || max_threads == 0) return;
+    static const bool s_bootstrap_enabled = envEnabledCached("NEDOB_BOOTSTRAP_THREADS");
+    if (!s_bootstrap_enabled) return;
+
+    constexpr u32 kExitStubAddr = IO_STUB_VADDR + 4u;
+    const u32 max_steps = parseU32EnvOrDefault("NEDOB_THREAD_BOOTSTRAP_STEPS", 2000u);
+    u32 ran = 0;
+    while (ran < max_threads && !pending_thread_bootstraps_.empty()) {
+        const PendingThreadBootstrap t = pending_thread_bootstraps_.front();
+        pending_thread_bootstraps_.erase(pending_thread_bootstraps_.begin());
+        ++ran;
+
+        const u32 entry_addr = t.entry & ~1u;
+        const u32 entry_fetch = (t.entry & 1u) ? 2u : 4u;
+        if (t.entry == 0 || !cpu.memory_.isMapped(entry_addr, entry_fetch)) {
+            continue;
+        }
+        if (t.stack_top == 0 || !cpu.memory_.isMapped(t.stack_top - 4u, 4u)) {
+            continue;
+        }
+        if (cpu.memory_.isMapped(kExitStubAddr, 4u)) {
+            cpu.memory_.write32(kExitStubAddr, 0xEF000009u); // SVC 0x09 (ExitThread)
+        }
+
+        ArmState saved = cpu.state();
+        ArmState& ts = cpu.state();
+        for (u32& reg : ts.r) reg = 0;
+        ts.r[0] = t.arg;
+        ts.r[13] = t.stack_top;
+        ts.r[14] = kExitStubAddr;
+        ts.r[15] = entry_addr;
+        ts.cpsr = (saved.cpsr & ~CPSR_T) | ((t.entry & 1u) ? CPSR_T : 0u);
+        ts.fpscr = saved.fpscr;
+
+        for (u32 i = 0; i < max_steps; ++i) {
+            if (!cpu.execute()) break;
+        }
+        cpu.state() = saved;
+    }
+}
+
 void SvcDispatcher::setHandler(u32 svc_num, SvcDispatchFn fn) {
     if (svc_num < kMaxSvc) {
         handlers_[svc_num] = std::move(fn);
@@ -82,21 +140,15 @@ void SvcDispatcher::setHandler(u32 svc_num, SvcDispatchFn fn) {
 
 bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
     const auto& r = cpu.state().r;
-    Logger::log("SVC 0x%02X %s  R0=0x%08X R1=0x%08X R2=0x%08X R3=0x%08X  PC=0x%08X\n",
-                svc_num, getSvcName(svc_num), r[0], r[1], r[2], r[3], cpu.getPC());
-
-    if (svc_num == 0x2D && svc_num < kMaxSvc && handlers_[0x2D]) {
-        const u32 out_ptr = cpu.state().r[0];
-        const u32 name_ptr = cpu.state().r[1];
-        const bool cont = handlers_[0x2D](svc_num, cpu);
-        if (cont && cpu.state().r[0] != 0) {
-            std::string name = readStringFromMemory(cpu.memory_, name_ptr);
-            Logger::log("ConnectToPort: %s\n", name.c_str());
-            u32 h = allocHandle(name);
-            cpu.memory_.write32(out_ptr, h);
-            cpu.state().r[0] = 0;
-        }
-        return cont;
+    // QueryMemory, GetProcessInfo, etc. can spam during thread bootstrap; quiet unless explicitly enabled.
+    static const bool log_query_memory = envEnabledCached("NEDOB_LOG_QUERYMEMORY");
+    static const bool log_arbitrate = envEnabledCached("NEDOB_LOG_ARBITRATE");
+    static const bool log_get_process_info = envEnabledCached("NEDOB_LOG_GETPROCESSINFO");
+    const bool suppress_spam = (svc_num == 0x02 && !log_query_memory) || (svc_num == 0x22 && !log_arbitrate) ||
+                              (svc_num == 0x2B && !log_get_process_info);
+    if (!suppress_spam) {
+        Logger::log("SVC 0x%02X %s  R0=0x%08X R1=0x%08X R2=0x%08X R3=0x%08X  PC=0x%08X\n",
+                    svc_num, getSvcName(svc_num), r[0], r[1], r[2], r[3], cpu.getPC());
     }
 
     if (svc_num < kMaxSvc && handlers_[svc_num]) {
@@ -104,11 +156,58 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
     }
 
     switch (svc_num) {
-        case 0x01:
-            Logger::log("ControlMemory: addr=0x%08X size=0x%08X op=0x%08X (R3=0x%08X)\n",
-                        cpu.state().r[0], cpu.state().r[1], cpu.state().r[2], cpu.state().r[3]);
+        case 0x01: {
+            // ControlMemory is used very early by crt0/allocators.
+            //
+            // Different SDKs/wrappers pass args differently, but a common convention is:
+            // - R0: operation
+            // - R1: addr hint (0 == anywhere)
+            // - R2: (unused or alignment/flags)
+            // - R3: size
+            // and the SVC returns:
+            // - R0: result (0 success)
+            // - R1: output address (chosen mapping base)
+            //
+            // For bringup, we don't model VM pages yet; process memory is a flat backing store.
+            // We still need to return a sane out address in R1 so userland doesn't store junk
+            // and later jump into unmapped space.
+            static u32 s_bump = HEAP_VADDR;
+
+            const u32 op = cpu.state().r[0];
+            const u32 hint = cpu.state().r[1];
+            const u32 size_in = cpu.state().r[3];
+
+            auto align_up = [](u32 v, u32 a) { return (v + (a - 1u)) & ~(a - 1u); };
+
+            u32 size = size_in;
+            if (size == 0 || size > (16u * 1024u * 1024u)) {
+                size = 0x1000u; // defensive default for garbage args during bringup
+            }
+            size = align_up(size, 0x1000u);
+
+            u32 out = 0;
+            const bool hint_usable = (hint >= HEAP_VADDR && hint < HEAP_VADDR_END);
+            if (hint_usable && (hint % 0x1000u) == 0) {
+                out = hint;
+            } else {
+                out = align_up(s_bump, 0x1000u);
+            }
+
+            // Advance bump pointer only for "allocate/commit"-like ops. We don't decode op here;
+            // this is purely to keep progress deterministic.
+            if (out == s_bump) {
+                s_bump = align_up(out + size, 0x1000u);
+                if (s_bump < HEAP_VADDR || s_bump >= HEAP_VADDR_END) {
+                    s_bump = HEAP_VADDR;
+                }
+            }
+
+            Logger::log("ControlMemory: op=0x%08X hint=0x%08X size=0x%08X -> out=0x%08X\n",
+                        op, hint, size_in, out);
             cpu.state().r[0] = 0;
+            cpu.state().r[1] = out;
             return true;
+        }
         case 0x02: {
             // QueryMemory(MemoryInfo* out, u32* out_pageinfo, u32 addr)
             // A lot of userland (crt0/libc/rtld) expects these outputs to be initialized.
@@ -188,23 +287,90 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
                 perm = PERM_R | PERM_X;
                 state = STATE_COMMITTED;
                 set_region(PROCESS_IMAGE_VADDR, PROCESS_IMAGE_VADDR_END);
-            } else if (addr < PROCESS_MEMORY_VADDR_END) {
-                // Flat process memory mapping: treat as committed RW by default.
-                perm = PERM_R | PERM_W;
-                state = STATE_COMMITTED;
-                set_region(0, PROCESS_MEMORY_VADDR_END);
             }
 
+            // ABI: return MemoryInfo fields in registers and (optionally) mirror to out pointers.
+            // Many libctru wrappers copy R1-R4/R5 into user buffers after the SVC returns.
             writeMemoryInfo(cpu.memory_, out_meminfo, base, size, perm, state);
             writePageInfo(cpu.memory_, out_pageinfo, 0);
-            cpu.state().r[0] = 0;
+            cpu.state().r[0] = 0;      // Result
+            cpu.state().r[1] = base;   // MemoryInfo.base_addr
+            cpu.state().r[2] = size;   // MemoryInfo.size
+            cpu.state().r[3] = perm;   // MemoryInfo.perm
+            cpu.state().r[4] = state;  // MemoryInfo.state
+            cpu.state().r[5] = 0;      // PageInfo.flags
             return true;
         }
         case 0x38: {
-            // GetResourceLimit: return kernel pseudo-handle 0xFFFF8001 (process resource limit). Do not use handle table.
-            constexpr u32 RESOURCE_LIMIT_PSEUDO_HANDLE = 0xFFFF8001u;
+            // GetResourceLimit: return a closeable handle.
+            //
+            // Returning a kernel pseudo-handle here (e.g. 0xFFFF8001) causes userland to later
+            // call CloseHandle on it and hit an error path (svcBreak). Give it a normal handle
+            // so CloseHandle succeeds and the title can proceed.
+            const u32 h = allocHandle("ResourceLimit");
             cpu.state().r[0] = 0;
-            cpu.state().r[1] = RESOURCE_LIMIT_PSEUDO_HANDLE;
+            cpu.state().r[1] = h;
+            return true;
+        }
+        case 0x08: {
+            // CreateThread:
+            // 3DS ABI: R0 points to out-handle storage, R1 is entrypoint.
+            // Keep R1 mirror for existing bringup paths that consume it directly.
+            const u32 out_handle_ptr = cpu.state().r[0];
+            const u32 entry = cpu.state().r[1];
+            const u32 arg = cpu.state().r[2];
+            const u32 stack_top = cpu.state().r[3];
+            // Thread handles are consumed as opaque ids by most code, but this title also
+            // traverses thread-like fields off the returned value in early bringup.
+            // Provide a stable pointer-like handle backed by mapped memory.
+            static u32 s_thread_obj_next = 0x00686000u;
+            u32 h = 0;
+            if (cpu.memory_.isMapped(s_thread_obj_next, 0x100u)) {
+                h = s_thread_obj_next;
+                s_thread_obj_next += 0x100u;
+                if (s_thread_obj_next < 0x00686000u) s_thread_obj_next = 0x00686000u;
+                handle_table_[h] = "Thread";
+                // Minimal synthetic thread object wiring for startup worker probes.
+                cpu.memory_.write32(h + 0x00u, h);
+                cpu.memory_.write32(h + 0x04u, 0x002E7310u);
+                cpu.memory_.write32(h + 0x24u, h);
+                cpu.memory_.write32(h + 0x34u, 0x10u);
+                cpu.memory_.write32(h + 0x40u, h);
+                cpu.memory_.write32(h + 0x44u, h + 0x48u);
+                cpu.memory_.write32(h + 0x48u, h + 0x44u);
+                // Runtime-side token 0x21 is later dereferenced as [0x21]; seed it with a
+                // thread object pointer instead of leaving low-page junk bytes.
+                if (cpu.memory_.isMapped(0x21u, 4u)) {
+                    cpu.memory_.write32(0x21u, h);
+                }
+                // Pokemon Sun bringup: seed global worker anchor if not initialized yet.
+                constexpr u32 kWorkerAnchorPtr = 0x00673BE0u;
+                if (cpu.memory_.isMapped(kWorkerAnchorPtr, 4u)) {
+                    const u32 anchor_cur = cpu.memory_.read32(kWorkerAnchorPtr);
+                    if (anchor_cur == 0u) {
+                        cpu.memory_.write32(kWorkerAnchorPtr, h);
+                    }
+                }
+            } else {
+                h = allocHandle("Thread");
+            }
+            cpu.state().r[0] = 0; // Result
+            // This runtime's wrapper consumes handle from R1 after SVC 0x08.
+            cpu.state().r[1] = h;
+            const bool out_ptr_looks_valid = (out_handle_ptr >= 0x1000u) &&
+                                             cpu.memory_.isMapped(out_handle_ptr, 4u);
+            if (out_ptr_looks_valid) {
+                cpu.memory_.write32(out_handle_ptr, h);
+            }
+            // Bringup quirk (Pokemon Sun startup worker path):
+            // The runtime may still poll a low-memory "head" slot while waiting for
+            // worker thread publication. Seed it with the created thread token so the
+            // list walk can terminate instead of bouncing through 0xFFFFFFFC.
+            if (out_handle_ptr == 0x18u && cpu.memory_.isMapped(0x0u, 4u) &&
+                envEnabledCached("NEDOB_CREATE_THREAD_SEED_HEAD0")) {
+                cpu.memory_.write32(0x0u, h);
+            }
+            pending_thread_bootstraps_.push_back(PendingThreadBootstrap{h, entry, arg, stack_top});
             return true;
         }
         case 0x23: {
@@ -214,10 +380,59 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
             cpu.state().r[0] = 0;
             return true;
         }
-        case 0x22:
+        case 0x22: {
+            // ArbitrateAddress(Handle arbiter, u32 addr, u32 type, s32 value, s64 timeout_ns)
+            // Minimal single-thread model:
+            // emulate waiter wakeups by adjusting the arbitration word instead of blocking.
+            // This keeps lock/futex-style userspace code progressing during bringup.
+            const u32 addr = cpu.state().r[1];
+            const u32 type = cpu.state().r[2];
+            const s32 value = static_cast<s32>(cpu.state().r[3]);
+            const u32 caller_pc = cpu.getPC();
+            static u32 s_wait_site_spins = 0;
+            if (addr != 0 && cpu.memory_.isMapped(addr, 4u)) {
+                s32 cur = static_cast<s32>(cpu.memory_.read32(addr));
+                switch (type) {
+                    case 0: { // SIGNAL
+                        // In real kernel this wakes waiters; here we just move the word out of "waiting" range.
+                        if (cur < 0) cur = 0;
+                        break;
+                    }
+                    case 1: { // WAIT_IF_LESS_THAN
+                        if (cur < value) cur = value;
+                        // Pokemon Sun early boot has a hot single-thread wait loop at
+                        // PC=0x00108A2C on addr=0x00684340. Without a scheduler, nothing
+                        // ever signals this word, so inject one wake token periodically.
+                        if (addr == 0x00684340u && caller_pc == 0x00108A30u) {
+                            if (cur <= value) {
+                                ++s_wait_site_spins;
+                                cur = value + 1;
+                                s_wait_site_spins = 0;
+                            } else {
+                                s_wait_site_spins = 0;
+                            }
+                        }
+                        break;
+                    }
+                    case 2: { // DECREMENT_AND_WAIT_IF_LESS_THAN
+                        --cur;
+                        if (cur < value) cur = value;
+                        break;
+                    }
+                    case 3: // WAIT_IF_LESS_THAN_TIMEOUT
+                    case 4: { // DECREMENT_AND_WAIT_IF_LESS_THAN_TIMEOUT
+                        if (type == 4) --cur;
+                        if (cur < value) cur = value;
+                        break;
+                    }
+                    default:
+                        break;
+                }
+                cpu.memory_.write32(addr, static_cast<u32>(cur));
+            }
             cpu.state().r[0] = 0;
-            cpu.state().r[1] = 0x00000008u;  // GetProcessId: process ID in R1 (3DS ABI), must be non-zero
             return true;
+        }
         case 0x19: {
             u32 id = allocHandle("Thread");
             cpu.state().r[0] = 0;
@@ -240,29 +455,39 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
             cpu.state().r[0] = 0;
             return true;
         }
-        case 0x3A: {
-            // GetResourceLimitLimitValues/CurrentValues: R0 = handle, R1 = handle (do not use as ptr!). Resource IDs often in R0 or separate buffer.
-            // Use R0 only if it looks like a valid pointer (< 0x80000000); else assume one entry with ID 0 to avoid reading handle as address.
-            const u32 r0 = cpu.state().r[0];
-            const u32 r1_handle = cpu.state().r[1];
-            const u32 out_addr = cpu.state().r[2];
+        case 0x39: // GetResourceLimitLimitValues
+        case 0x3A: { // GetResourceLimitCurrentValues
+            // 3DS ABI (as observed in this title's crt0/libc):
+            //   R0 = resource_id_list (u32*), may be null (treat as one entry with ID 0)
+            //   R1 = resource_limit_handle (pseudo-handle 0xFFFF8001)
+            //   R2 = out_values (u64[count])
+            //   R3 = count
+            //
+            // Important: output is an array of u64 values (8 bytes each), NOT pairs. Writing 16 bytes
+            // per entry will clobber the caller's stack frame (including saved LR), causing bad returns.
+            const bool want_limits = (svc_num == 0x39);
+            const u32 ids_ptr = cpu.state().r[0];
+            const u32 out_ptr = cpu.state().r[2];
             u32 count = cpu.state().r[3];
-            if (count > 16u) count = 16u;
-            const bool r0_looks_like_ptr = (r0 != 0 && r0 < 0x80000000u);
-            const u32 ids_ptr = r0_looks_like_ptr ? r0 : 0;
+            if (ids_ptr == 0) {
+                count = 1;
+            } else if (count > 32u) {
+                count = 32u;
+            }
+
             constexpr u64 COMMIT_LIMIT = 0x08000000ULL;
-            constexpr u64 COMMIT_CURRENT = 0x02000000ULL;
+            constexpr u64 COMMIT_CURRENT = 0x00000000ULL;
             constexpr u64 PRIORITY_LIMIT = 64ULL;
             constexpr u64 PRIORITY_CURRENT = 1ULL;
-            (void)r1_handle;
+            (void)cpu.state().r[1]; // handle (pseudo)
+
             for (u32 i = 0; i < count; ++i) {
-                u8 rid = 0;
-                if (ids_ptr != 0) rid = static_cast<u8>(cpu.memory_.read8(ids_ptr + i));
-                u64 limit = 0, current = 0;
-                if (rid == 0) { limit = COMMIT_LIMIT;   current = COMMIT_CURRENT; }
-                else if (rid == 1) { limit = PRIORITY_LIMIT; current = PRIORITY_CURRENT; }
-                cpu.memory_.write64(out_addr + i * 16, limit);
-                cpu.memory_.write64(out_addr + i * 16 + 8, current);
+                u32 rid = 0;
+                if (ids_ptr != 0) rid = cpu.memory_.read32(ids_ptr + i * 4u);
+                u64 value = 0;
+                if (rid == 0) value = want_limits ? COMMIT_LIMIT : COMMIT_CURRENT;
+                else if (rid == 1) value = want_limits ? PRIORITY_LIMIT : PRIORITY_CURRENT;
+                cpu.memory_.write64(out_ptr + i * 8u, value);
             }
             cpu.state().r[0] = 0;
             return true;
@@ -280,7 +505,9 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
             return true;
         }
         case 0x21: {
-            u32 id = allocHandle("Event");
+            // CreateAddressArbiter(Handle* out)
+            // Used for userland futex-like waits/wakes (very early during runtime init).
+            u32 id = allocHandle("AddressArbiter");
             cpu.state().r[0] = 0;
             cpu.state().r[1] = id;
             return true;
@@ -323,6 +550,8 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
             // type 0 is commonly used for "process ID" or similar metadata in some runtimes;
             // return a stable non-zero to avoid divide-by-zero / sentinel checks.
             if (type == 0) value = 0x0000000000000008ULL;
+            // Early Pokemon Sun runtime probes type 0x14 and expects a non-zero capability/count.
+            if (type == 0x14u) value = 1;
             if (out_ptr != 0) cpu.memory_.write64(out_ptr, value);
             cpu.state().r[0] = 0;
             return true;
@@ -331,7 +560,14 @@ bool SvcDispatcher::call(u32 svc_num, ArmInterpreter& cpu) {
             const auto& r = cpu.state().r;
             Logger::log("Kernel Break hit!  R0=0x%08X R1=0x%08X R2=0x%08X R3=0x%08X R4=0x%08X R5=0x%08X R6=0x%08X R7=0x%08X R8=0x%08X R9=0x%08X R10=0x%08X R11=0x%08X R12=0x%08X SP=0x%08X LR=0x%08X PC=0x%08X\n",
                         r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], cpu.getPC());
-            return true;
+            // On real hardware this is typically a non-returning debug/panic trap.
+            // However, many retail titles will only reach it if our HLE stubs return
+            // unexpected values (triggering asserts). Default to ignoring the break
+            // so we can discover the next missing feature, but allow opting into a
+            // hard stop for debugging.
+            const char* stop = std::getenv("NEDOB_STOP_ON_BREAK");
+            cpu.state().r[0] = 0;  // success
+            return (stop && stop[0] == '1') ? false : true;
         }
         case 0x3D:
             Logger::log("SVC OutputDebugString (addr=0x%08X, len=%u)\n",

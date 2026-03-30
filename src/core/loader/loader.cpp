@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <fstream>
 #include <cstring>
+#include <algorithm>
 #include <string>
 
 namespace {
@@ -89,31 +90,46 @@ LoaderResult loadNcch(const std::string& filepath, LoadResult& out) {
                 const u32 data_size = exheader.codeset_info.data.code_size;
                 const u32 bss_size = exheader.codeset_info.bss_size;
 
-                const std::size_t min_code_size = out.text_size + ro_size + data_size;
+                auto align_up = [](std::size_t v, std::size_t a) { return (v + (a - 1)) & ~(a - 1); };
+                const std::size_t text_file = static_cast<std::size_t>(out.text_size);
+                const std::size_t ro_file = static_cast<std::size_t>(ro_size);
+                const std::size_t data_file = static_cast<std::size_t>(data_size);
+                const std::size_t min_code_size = text_file + ro_file + data_file;
                 if (min_code_size > 0 && min_code_size <= out.code.size()) {
                     std::size_t offset = 0;
                     if (out.text_size > 0) {
                         CodeSegment seg;
+                        const std::size_t text_map = std::max(
+                            static_cast<std::size_t>(exheader.codeset_info.text.num_max_pages) * 0x1000u,
+                            align_up(text_file, 0x1000u));
                         seg.vaddr = out.text_address;
-                        seg.size = out.text_size;
-                        seg.data.assign(out.code.begin() + offset, out.code.begin() + offset + out.text_size);
+                        seg.size = static_cast<u32>(text_map);
+                        seg.data.resize(text_map, 0);
+                        std::memcpy(seg.data.data(), out.code.data() + offset, text_file);
                         out.segments.push_back(std::move(seg));
-                        offset += out.text_size;
+                        offset += text_file;
                     }
                     if (ro_size > 0) {
                         CodeSegment seg;
+                        const std::size_t ro_map = std::max(
+                            static_cast<std::size_t>(exheader.codeset_info.ro.num_max_pages) * 0x1000u,
+                            align_up(ro_file, 0x1000u));
                         seg.vaddr = ro_addr;
-                        seg.size = ro_size;
-                        seg.data.assign(out.code.begin() + offset, out.code.begin() + offset + ro_size);
+                        seg.size = static_cast<u32>(ro_map);
+                        seg.data.resize(ro_map, 0);
+                        std::memcpy(seg.data.data(), out.code.data() + offset, ro_file);
                         out.segments.push_back(std::move(seg));
-                        offset += ro_size;
+                        offset += ro_file;
                     }
                     if (data_size > 0) {
                         CodeSegment seg;
+                        const std::size_t data_map = std::max(
+                            static_cast<std::size_t>(exheader.codeset_info.data.num_max_pages) * 0x1000u,
+                            align_up(data_file, 0x1000u));
                         const std::size_t bss_pages = (bss_size + 0xFFF) & ~0xFFFu;
                         seg.vaddr = data_addr;
-                        seg.size = static_cast<u32>(data_size + bss_pages);
-                        seg.data.resize(data_size + bss_pages, 0);
+                        seg.size = static_cast<u32>(data_map + bss_pages);
+                        seg.data.resize(data_map + bss_pages, 0);
                         std::memcpy(seg.data.data(), out.code.data() + offset, data_size);
                         out.segments.push_back(std::move(seg));
                     }
@@ -153,31 +169,46 @@ LoaderResult loadNcch(const std::string& filepath, LoadResult& out) {
     const u32 data_size = ncch.getDataSize();
     const u32 bss_size = ncch.getBssSize();
 
-    const std::size_t min_code_size = out.text_size + ro_size + data_size;
+    auto align_up = [](std::size_t v, std::size_t a) { return (v + (a - 1)) & ~(a - 1); };
+    const std::size_t text_file = static_cast<std::size_t>(out.text_size);
+    const std::size_t ro_file = static_cast<std::size_t>(ro_size);
+    const std::size_t data_file = static_cast<std::size_t>(data_size);
+    const std::size_t min_code_size = text_file + ro_file + data_file;
     if (min_code_size > 0 && min_code_size <= out.code.size()) {
         std::size_t offset = 0;
         if (out.text_size > 0) {
             CodeSegment seg;
+            const std::size_t text_map = std::max(
+                static_cast<std::size_t>(ncch.getTextMaxPages()) * 0x1000u,
+                align_up(text_file, 0x1000u));
             seg.vaddr = out.text_address;
-            seg.size = out.text_size;
-            seg.data.assign(out.code.begin() + offset, out.code.begin() + offset + out.text_size);
+            seg.size = static_cast<u32>(text_map);
+            seg.data.resize(text_map, 0);
+            std::memcpy(seg.data.data(), out.code.data() + offset, text_file);
             out.segments.push_back(std::move(seg));
-            offset += out.text_size;
+            offset += text_file;
         }
         if (ro_size > 0) {
             CodeSegment seg;
+            const std::size_t ro_map = std::max(
+                static_cast<std::size_t>(ncch.getRoMaxPages()) * 0x1000u,
+                align_up(ro_file, 0x1000u));
             seg.vaddr = ro_addr;
-            seg.size = ro_size;
-            seg.data.assign(out.code.begin() + offset, out.code.begin() + offset + ro_size);
+            seg.size = static_cast<u32>(ro_map);
+            seg.data.resize(ro_map, 0);
+            std::memcpy(seg.data.data(), out.code.data() + offset, ro_file);
             out.segments.push_back(std::move(seg));
-            offset += ro_size;
+            offset += ro_file;
         }
         if (data_size > 0) {
             CodeSegment seg;
+            const std::size_t data_map = std::max(
+                static_cast<std::size_t>(ncch.getDataMaxPages()) * 0x1000u,
+                align_up(data_file, 0x1000u));
             const std::size_t bss_pages = (bss_size + 0xFFF) & ~0xFFFu;
             seg.vaddr = data_addr;
-            seg.size = static_cast<u32>(data_size + bss_pages);
-            seg.data.resize(data_size + bss_pages, 0);
+            seg.size = static_cast<u32>(data_map + bss_pages);
+            seg.data.resize(data_map + bss_pages, 0);
             std::memcpy(seg.data.data(), out.code.data() + offset, data_size);
             out.segments.push_back(std::move(seg));
         }
@@ -205,32 +236,47 @@ LoaderResult loadNcch(const std::string& filepath, LoadResult& out) {
                 const u32 data_addr = exheader.codeset_info.data.address;
                 const u32 data_size = exheader.codeset_info.data.code_size;
                 const u32 bss_size = exheader.codeset_info.bss_size;
-                const std::size_t min_code_size = out.text_size + ro_size + data_size;
+                auto align_up = [](std::size_t v, std::size_t a) { return (v + (a - 1)) & ~(a - 1); };
+                const std::size_t text_file = static_cast<std::size_t>(out.text_size);
+                const std::size_t ro_file = static_cast<std::size_t>(ro_size);
+                const std::size_t data_file = static_cast<std::size_t>(data_size);
+                const std::size_t min_code_size = text_file + ro_file + data_file;
                 out.segments.clear();
                 if (min_code_size > 0 && min_code_size <= out.code.size()) {
                     std::size_t offset = 0;
                     if (out.text_size > 0) {
                         CodeSegment seg;
+                        const std::size_t text_map = std::max(
+                            static_cast<std::size_t>(exheader.codeset_info.text.num_max_pages) * 0x1000u,
+                            align_up(text_file, 0x1000u));
                         seg.vaddr = out.text_address;
-                        seg.size = out.text_size;
-                        seg.data.assign(out.code.begin() + offset, out.code.begin() + offset + out.text_size);
+                        seg.size = static_cast<u32>(text_map);
+                        seg.data.resize(text_map, 0);
+                        std::memcpy(seg.data.data(), out.code.data() + offset, text_file);
                         out.segments.push_back(std::move(seg));
-                        offset += out.text_size;
+                        offset += text_file;
                     }
                     if (ro_size > 0) {
                         CodeSegment seg;
+                        const std::size_t ro_map = std::max(
+                            static_cast<std::size_t>(exheader.codeset_info.ro.num_max_pages) * 0x1000u,
+                            align_up(ro_file, 0x1000u));
                         seg.vaddr = ro_addr;
-                        seg.size = ro_size;
-                        seg.data.assign(out.code.begin() + offset, out.code.begin() + offset + ro_size);
+                        seg.size = static_cast<u32>(ro_map);
+                        seg.data.resize(ro_map, 0);
+                        std::memcpy(seg.data.data(), out.code.data() + offset, ro_file);
                         out.segments.push_back(std::move(seg));
-                        offset += ro_size;
+                        offset += ro_file;
                     }
                     if (data_size > 0) {
                         CodeSegment seg;
+                        const std::size_t data_map = std::max(
+                            static_cast<std::size_t>(exheader.codeset_info.data.num_max_pages) * 0x1000u,
+                            align_up(data_file, 0x1000u));
                         const std::size_t bss_pages = (bss_size + 0xFFF) & ~0xFFFu;
                         seg.vaddr = data_addr;
-                        seg.size = static_cast<u32>(data_size + bss_pages);
-                        seg.data.resize(data_size + bss_pages, 0);
+                        seg.size = static_cast<u32>(data_map + bss_pages);
+                        seg.data.resize(data_map + bss_pages, 0);
                         std::memcpy(seg.data.data(), out.code.data() + offset, data_size);
                         out.segments.push_back(std::move(seg));
                     }
