@@ -9,9 +9,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIGURATION>")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIGURATION>")
 
-# SDL3 library directory (pre-built libraries)
-set(SDL3_LIB_DIR "${CMAKE_SOURCE_DIR}/vendored/SDL3")
-
 # This assumes SDL source is available in vendored/SDL
 add_subdirectory(vendored/SDL EXCLUDE_FROM_ALL)
 
@@ -27,8 +24,3 @@ add_executable(NedobEMU ${SOURCES} ${HEADERS})
 
 # Link to SDL3 library
 target_link_libraries(NedobEMU PRIVATE SDL3::SDL3)
-
-# Include directories (SDL3 includes come from SDL3::SDL3 target; tiny_aes is C vendored)
-target_include_directories(NedobEMU PRIVATE
-    "${CMAKE_SOURCE_DIR}/vendored/tiny_aes"
-)

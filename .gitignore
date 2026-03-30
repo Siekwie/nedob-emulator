@@ -4,6 +4,4 @@
 /build_local
 /build_agent
 /insp
-/vendored/SDL
-/build_agent
-/build_local
+/vendored

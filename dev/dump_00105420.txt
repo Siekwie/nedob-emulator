@@ -1,0 +1,86 @@
+libEGL warning: failed to get driver name for fd -1
+
+libEGL warning: MESA-LOADER: failed to retrieve device information
+
+libEGL warning: failed to get driver name for fd -1
+
+MESA: error: ZINK: failed to choose pdev
+libEGL warning: egl: failed to create dri2 screen
+NCCH: WARNING: .code larger than expected (5713920 > 5708376)
+Loader: code source = raw (no crypto). First 16 bytes: 07 00 00 EB 6A 11 00 EB 4B 1A 00 EB 85 11 00 EB 
+Loader: WARNING: first word is not typical ARM B; may be encrypted or wrong offset.
+Panic patch: wrote 0xEA000B13 @0x00104868
+Panic patch: wrote 0xE12FFF12 @0x001074D4
+Panic patch: wrote 0xE12FFF1E @0x001074D8
+NEDOB_DUMP_WORDS: addr=0x00105420 count=24
+  [0x00105420] = 0xE1A01005
+  [0x00105424] = 0xEB000390
+  [0x00105428] = 0xE5940000
+  [0x0010542C] = 0xE28610A4
+  [0x00105430] = 0xE24820A4
+  [0x00105434] = 0xE5903000
+  [0x00105438] = 0xE593C058
+  [0x0010543C] = 0xE1A0300B
+  [0x00105440] = 0xE12FFF3C
+  [0x00105444] = 0xE5940000
+  [0x00105448] = 0xE5901000
+  [0x0010544C] = 0xE5912068
+  [0x00105450] = 0xE1A01009
+  [0x00105454] = 0xE12FFF32
+  [0x00105458] = 0xE5940004
+  [0x0010545C] = 0xE3570000
+  [0x00105460] = 0xE3800001
+  [0x00105464] = 0xE5840004
+  [0x00105468] = 0x13800002
+  [0x0010546C] = 0x15840004
+  [0x00105470] = 0xE5940000
+  [0x00105474] = 0xE8BD9FF0
+  [0x00105478] = 0xE599200C
+  [0x0010547C] = 0xE3A00000
+ThreeDS: ROM loaded: /home/siekwie/Documents/ROMs/3DS/PokemonSun/decrypted/PokemonSun.3ds (entry=0x00100000, code=5713920 bytes)
+SVC 0x2B GetProcessInfo  R0=0x0FFFDFE8 R1=0x00720061 R2=0x00000014 R3=0x00000003  PC=0x00106364
+CPU: patching mutex wait word at 0x00684340 after spin loop at PC=0x00108C38
+SVC 0x38 GetResourceLimit  R0=0x0FFFDFC0 R1=0x3DFAB273 R2=0x00000000 R3=0x00000000  PC=0x00105578
+SVC 0x3A GetResourceLimitCurrentValues  R0=0x0FFFDFB8 R1=0x00000001 R2=0x0FFFDFC4 R3=0x00000001  PC=0x00104C0C
+SVC 0x23 CloseHandle  R0=0x00000001 R1=0x00000001 R2=0x0FFFDFC4 R3=0x00000001  PC=0x00104C14
+SVC 0x01 ControlMemory  R0=0x00000001 R1=0x0840C000 R2=0x00000000 R3=0x6B2E9065  PC=0x00105544
+ControlMemory: op=0x00000001 hint=0x0840C000 size=0x6B2E9065 -> out=0x0840C000
+SVC 0x01 ControlMemory  R0=0x00000001 R1=0x69A02170 R2=0x00000000 R3=0x6033B254  PC=0x00105544
+ControlMemory: op=0x00000001 hint=0x69A02170 size=0x6033B254 -> out=0x08000000
+SVC 0x697461 Unknown  R0=0x080009B0 R1=0x08000A54 R2=0x002BC5AC R3=0x280026C0  PC=0x005FA594
+SVC 0x697461 Unknown (stub) at PC 0x005FA594
+Memory: unmapped write8 pc=0x005FA648 addr=0x802FE9B4 value=0xA7 (no-op)
+Memory: unmapped write8 pc=0x005FA664 addr=0x8BFFFECE value=0xD4 (no-op)
+SVC 0x506C6C Unknown  R0=0xE5C460A2 R1=0x07FFFCDF R2=0x002BC5AC R3=0x07D43ED4  PC=0x005FA66C
+SVC 0x506C6C Unknown (stub) at PC 0x005FA66C
+Memory: unmapped read32 pc=0x005FA6AC addr=0x87FFFCB1 -> 0
+SVC 0x737361 Unknown  R0=0x00000000 R1=0x87FFFCB1 R2=0x002BC035 R3=0x00000000  PC=0x005FA6B8
+SVC 0x737361 Unknown (stub) at PC 0x005FA6B8
+SVC 0x5F3031 Unknown  R0=0x00000000 R1=0x87FFFCB1 R2=0x002BC035 R3=0x00000000  PC=0x005FA6C8
+SVC 0x5F3031 Unknown (stub) at PC 0x005FA6C8
+SVC 0x5F3032 Unknown  R0=0x00000000 R1=0x87FFFCB1 R2=0x002BC035 R3=0x00000000  PC=0x005FA6D4
+SVC 0x5F3032 Unknown (stub) at PC 0x005FA6D4
+SVC 0x30314E Unknown  R0=0x00000000 R1=0x87FFFCB1 R2=0x002BC035 R3=0x00000000  PC=0x005FA6EC
+SVC 0x30314E Unknown (stub) at PC 0x005FA6EC
+Memory: unmapped write8 pc=0x005FA6F0 addr=0xE5C4105F value=0x08 (no-op)
+SVC 0x313231 Unknown  R0=0xE5840074 R1=0xE5960000 R2=0xE5840064 R3=0xE5960004  PC=0x005FA6F8
+SVC 0x313231 Unknown (stub) at PC 0x005FA6F8
+SVC 0x657079 Unknown  R0=0x00000000 R1=0xE5960000 R2=0xE5840064 R3=0xE5960004  PC=0x005FA708
+SVC 0x657079 Unknown (stub) at PC 0x005FA708
+SVC 0x666E69 Unknown  R0=0x00000000 R1=0xE5960000 R2=0xE5840064 R3=0xE5960004  PC=0x005FA70C
+SVC 0x666E69 Unknown (stub) at PC 0x005FA70C
+Memory: unmapped write8 pc=0x005FA72C addr=0xB02BC12D value=0x69 (no-op)
+Memory: unmapped write8 pc=0x005FA730 addr=0xE595FB9F value=0x69 (no-op)
+Memory: unmapped write8 pc=0x005FA750 addr=0xE5C4700C value=0x08 (no-op)
+ARM: unknown opcode 0x4E004564 at PC 0x005FA75C
+Memory: unmapped write32 pc=0x005FA760 addr=0xB02BBAB8 value=0x00000000 (no-op)
+ARM: unknown opcode 0x4E353261 at PC 0x005FA76C
+Memory: broke spin-wait at pc=0x00000000 addr=0x00000000 (forced 0x04000000)
+Nedob Emulator - Development ROM mode
+Using hardcoded ROM: /home/siekwie/Documents/ROMs/3DS/PokemonSun/decrypted/PokemonSun.3ds
+Selected ROM: /home/siekwie/Documents/ROMs/3DS/PokemonSun/decrypted/PokemonSun.3ds
+ROM Type: Nintendo 3DS
+Starting emulation...
+Frame 30 PC=0x00000000 R0=0xFFFFFFBB R1=0x00000000 R2=0x00000000 NZCV=1000
+Application: reached frame limit (60), stopping.
+Emulation ended.
